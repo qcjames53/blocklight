@@ -1,0 +1,3 @@
+# This will be compiled to bl_example:hello_world/hello.
+function hello:
+    say Hello, world!

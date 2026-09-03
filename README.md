@@ -6,27 +6,6 @@ Well, "best" is relative. There are probably hundreds of mcfunction compilers th
 ## You already know the syntax
 Blocklight stays out of your way. It's really fast. It's really intuitive. Your datapack will almost certainly still work after any Minecraft update.
 
-```
-function fizzbuzz:
-    python:
-        bl.eval("#mod_a:__bl = $(i) % 3")
-        bl.eval("#mod_b:__bl = $(i) % 5")
-    
-    if (score #mod_a __bl matches 0) && (score #mod_b __bl matches 0):
-        $say $(string_ab)
-        return
-    if score #mod_a __bl matches 0:
-        $say $(string_a)
-        return
-    if score #mod_b __bl matches 0:
-        $say $(string_b)
-
-function fizzbuzz_runner:
-    python:
-        for i in range(20):
-            emit(f'function demo:fizzbuzz with {{"i": {i}, "string_a": "Fizz", "string_b": "Buzz", "string_ab": "Fizzbuzz"}}')
-```
-
 ## The core tenets
 1. **Do one thing and do it WELL**
 
@@ -42,6 +21,6 @@ function fizzbuzz_runner:
 
 4. **Stick to functions**
 
-    Do not try to be the all-in-one datapack wizard tool. How do you compile structure NBT AND custom dimension json AND OpenGL shader language? I mean, you can do it all; it's just a lot of burden for little synergy. Stick to `.bl` source that compiles into `.mcfunction` files.
+    Do not try to be the all-in-one datapack wizard tool. How do you compile structure NBT AND custom dimension json AND OpenGL shader language? I mean, you can do it all; it's just a lot of burden for little synergy. Stick to `.blt` source that compiles into `.mcfunction` files.
 
 © 2026 by Quinn James. Licensed under [GNU GPL v3](LICENSE)

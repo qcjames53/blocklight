@@ -1,0 +1,28 @@
+function hardcode_example:
+    python:
+        for i in range(20):
+            emit("say hi")
+
+
+function eval_example:
+    # Constants inside eval statements will be precomputed as much as possible
+    python:
+        bl.eval("#result:example_var = 8 + 6 - 7 * 5 / 3 % 9")
+    tellraw @s ["Result 1: ",{"score":{"name":"#result","objective":"example_var"}}]
+
+    # But calculations requiring variables will be runtime-only
+    scoreboard players set #a example_var 8
+    scoreboard players set #b example_var 6
+    scoreboard players set #c example_var 7
+    scoreboard players set #d example_var 5
+    scoreboard players set #e example_var 3
+    scoreboard players set #f example_var 9
+    python:
+        bl.eval("#result:example_var = #a:example_var + #b:example_var - #c:example_var * #d:example_var / #e:example_var % #f:example_var")
+    tellraw @s ["Result 2: ",{"score":{"name":"#result","objective":"example_var"}}]
+
+
+function locators_example:
+    python:
+        emit(f"say Function name: '{_FUNCTION}'")
+        emit(f"say Function location: '{_PATH}'")

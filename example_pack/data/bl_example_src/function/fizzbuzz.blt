@@ -1,0 +1,22 @@
+function fizzbuzz:    
+    python:
+        bl.eval("#mod_a:__bl = $(i) % 3")
+        bl.eval("#mod_b:__bl = $(i) % 5")
+    
+    if (score #mod_a __bl matches 0) && (score #mod_b __bl matches 0):
+        $say $(string_ab)
+    elif score #mod_a __bl matches 0:
+        $say $(string_a)
+    elif score #mod_b __bl matches 0:
+        $say $(string_b)
+    else
+        $say $(string_miss)
+
+function fizzbuzz_runner:
+    function bl_example:fizzbuzz/fizzbuzz with { \
+        "i": 1, \
+        "string_a": "Fizz", \
+        "string_b": "Buzz", \
+        "string_ab": "Fizzbuzz", \
+        "string_miss": "..." \
+    }

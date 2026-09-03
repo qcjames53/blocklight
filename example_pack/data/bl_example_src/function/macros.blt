@@ -1,0 +1,15 @@
+function macros_demo_a:
+    # Macros will survive any scoping within a function...
+    as @s:
+        at @s:
+            positioned ~ ~ ~:
+                $say $(a) from macros_demo_a
+
+    # ...but are required to be explicitly passed into other functions
+    function bl_example:macros/macros_demo_b with {"a": "$(a)"} 
+    
+function macros_demo_b:
+    $say $(a) from macros_demo_b
+
+function macros_demo_runner:
+    function bl_example:macros/macros_demo_a with {"a": "hello"}

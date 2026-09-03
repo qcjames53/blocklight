@@ -1,0 +1,6 @@
+{
+    "pack": {
+        "description": "Example datapack for the blocklight compiler",
+        "min_format": 107
+    }
+}
