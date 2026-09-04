@@ -1,10 +1,12 @@
-function fizzbuzz:    
+# This example runs a game of Fizzbuzz using function macros for the inputs
+
+function fizzbuzz:
     scoreboard players set #i example_var 1
     while (score #i example_var matches ..$(max)):
         python:
             bl.eval("#mod_a:example_var = #i:example_var % 3")
             bl.eval("#mod_b:example_var = #i:example_var % 5")
-        
+
         if (score #mod_a example_var matches 0) && (score #mod_b example_var matches 0):
             $say $(string_ab)
         elif score #mod_a example_var matches 0:

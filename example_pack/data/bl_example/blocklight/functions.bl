@@ -1,0 +1,27 @@
+# Functions are the bread and butter of Blocklight. All code must be placed inside of a function.
+
+# Source file names are treated as the parent directory for generated functions:
+function hello:
+    say Hello, world!
+# This compiles to `./function/hello_world/hello.mcfunction`
+
+
+# Functions can be compiled to the top level directory using the `root` keyword:
+root function hello_root:
+    say Hello, root!
+# This compiles to `./function/hello_root.mcfunction`
+
+
+# Functions can be run on datapack load using the `load` keyword:
+load function hello_load:
+    say Hello, load!
+
+
+# Functions can be run every tick using the `tick` keyword:
+tick function hello_tick:
+    say Hello, tick!
+
+
+# You can combine function keywords in any order:
+root load tick function hello_universe:
+    say Hello, universe!

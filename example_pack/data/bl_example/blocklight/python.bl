@@ -29,12 +29,12 @@ function eval_example:
 
 
 function locators_example:
-    # These are all available inside every python: block for free.
+    # These are all available inside every `python:` block for free.
     python:
         emit(f"say Relative filepath: '{bl.PATH}'")
         emit(f"say Datapack name: '{bl.PACK_NAME}'")
+        emit(f"say Datapack format: '{bl.PACK_FORMAT}'")  # Major pack version only (e.g. 107), resolves to min_format if not provided explicitly
         emit(f"say Namespace: '{bl.NAMESPACE}'")
         emit(f"say Source file: '{bl.FILE}'")
         emit(f"say Function name: '{bl.FUNCTION}'")
-        emit(f"say Pack format / minimum pack format: '{bl.PACK_FORMAT}'")  # Major pack version only (e.g. 107)
         emit(f"say Blocklight version: '{bl.BLOCKLIGHT_VERSION}'")
