@@ -1,16 +1,16 @@
 # This example runs binary search to return the ocean floor Y height.
 
 function ocean_floor_height:
-    if (score #low example_var > #high example_var):
+    if score #low example_var > #high example_var:
         return run scoreboard players get #high example_var
 
-    $positioned ~ $(targetY) ~:
+    positioned ~ $(targetY) ~:
         if !(block ~ ~ ~ minecraft:water) && (block ~ ~1 ~ minecraft:water):
-            $return $(targetY)
+            return $(targetY)
         if !(block ~ ~ ~ minecraft:water):
             python:
                 bl.eval("#low:example_var = #mid:example_var + 1")
-        if (block ~ ~ ~ minecraft:water):
+        if block ~ ~ ~ minecraft:water:
             python:
                 bl.eval("#high:example_var = #mid:example_var - 1")
 

@@ -1,0 +1,26 @@
+function fizzbuzz:    
+    scoreboard players set #i example_var 1
+    while (score #i example_var matches ..$(max)):
+        python:
+            bl.eval("#mod_a:example_var = #i:example_var % 3")
+            bl.eval("#mod_b:example_var = #i:example_var % 5")
+        
+        if (score #mod_a example_var matches 0) && (score #mod_b example_var matches 0):
+            $say $(string_ab)
+        elif score #mod_a example_var matches 0:
+            $say $(string_a)
+        elif score #mod_b example_var matches 0:
+            $say $(string_b)
+        else:
+            $say $(string_miss)
+
+        scoreboard players add #i example_var 1
+
+function fizzbuzz_runner:
+    function bl_example:fizzbuzz/fizzbuzz with { \
+        "max": 20, \
+        "string_a": "Fizz", \
+        "string_b": "Buzz", \
+        "string_ab": "Fizzbuzz", \
+        "string_miss": "..." \
+    }

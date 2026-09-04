@@ -1,0 +1,7 @@
+# Because the function name is not provided, this compiles to `hello_world.mcfunction`.
+function:
+    say Hello, world!
+
+# Because the function name is provided, `hello.mcfunction` is added to the `hello_world` directory.
+function hello:
+    say Hello, world!
