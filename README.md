@@ -13,7 +13,7 @@ Blocklight is a microcompiler which robustly solves these problems:
 ## You already know the rules
 BECAUSE THERE AREN'T ANY.
 
-Sorry about that. Of course there are rules. But Blocklight enforces the minimum syntax it can to output a valid script. The world doesn't need another outdated, unmaintained command compiler refusing to build because the latest `/particle` syntax changed. Blocklight doesn't even know what a command _is_. That's intentional.
+Sorry about that. Of course there are rules. But Blocklight enforces the minimum syntax required to output a valid script. The world doesn't need another outdated, unmaintained command compiler refusing to build because the latest `/particle` syntax changed. Blocklight doesn't even know what a command _is_. That's intentional.
 
 ```
 function aloha:

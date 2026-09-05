@@ -1,4 +1,4 @@
-def test_parent_function(compile_bl):
+def test_root_function(compile_bl):
     result = compile_bl("hello_world.bl", """\
 root function hello:
     say Hello, world!
