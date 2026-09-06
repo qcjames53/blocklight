@@ -10,6 +10,17 @@ Blocklight is a microcompiler which robustly solves these problems:
 - Function macros are usable across an ENTIRE function, including from within internal blocks.
 - Return commands return across their ENTIRE function, including from within internal blocks.
 
+```
+function get_speed_modifier:
+    at @s:
+        if player @s[tag=team_$(team_in_lead)]:
+            particle dust{color:[0.3,0,0],scale:0.5} ~ ~ ~ 1 0.2 1 0 5 normal
+            playsound custom/slowdown block @s ~ ~ ~ 0.2 $(current_speed_pitch)
+            return 40
+        else:
+            return 50
+```
+
 ## You already know the rules
 BECAUSE THERE AREN'T ANY.
 

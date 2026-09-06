@@ -1,10 +1,8 @@
 """Blocklight - A blazing fast mcfunction microcompiler"""
 
 import string
-import textwrap
 from collections.abc import Iterator
 from dataclasses import dataclass
-from itertools import islice
 
 
 # ------------------ #

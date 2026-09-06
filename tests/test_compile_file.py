@@ -1,3 +1,5 @@
+# Test compilation of full files with basic functions (no blocks)
+
 import blocklight
 
 
