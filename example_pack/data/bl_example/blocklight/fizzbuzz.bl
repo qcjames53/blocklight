@@ -7,7 +7,7 @@ function fizzbuzz:
             bl.eval("#mod_a:example_var = #i:example_var % 3")
             bl.eval("#mod_b:example_var = #i:example_var % 5")
 
-        if (score #mod_a example_var matches 0) && (score #mod_b example_var matches 0):
+        if (score #mod_a example_var matches 0) and (score #mod_b example_var matches 0):
             $say $(string_ab)
         elif score #mod_a example_var matches 0:
             $say $(string_a)
