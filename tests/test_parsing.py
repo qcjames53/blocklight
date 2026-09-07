@@ -22,25 +22,26 @@ def test_split_lines():
     ]
 
 
-def test_functions_iterator():
-    source = """\
+def test_span_iterator_top_level():
+    source = ("""\
 function a:
     foo
     bar
 function b:
 function c:
     foo
-"""
-    lines = blocklight.split_lines(source)
-    assert list(blocklight.functions_iterator(lines)) == [
+""")
+    ctx = blocklight.FileContext(local_path="foo", source_lines=blocklight.split_lines(source))
+    assert list(blocklight.span_iterator(ctx, 0, len(ctx.source_lines), 0)) == [
         (0, 3),
         (3, 4),
         (4, 6),
     ]
 
 
-def test_functions_iterator_no_functions():
-    assert list(blocklight.functions_iterator(blocklight.split_lines(""))) == []
+def test_span_iterator_no_functions():
+    ctx = blocklight.FileContext(local_path="foo", source_lines=blocklight.split_lines(""))
+    assert list(blocklight.span_iterator(ctx, 0, len(ctx.source_lines), 0)) == []
     out = blocklight.CompiledOutput()
     blocklight.compile_file(out, "blank", "")
     assert out.files == {} and out.errors == []

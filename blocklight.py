@@ -11,7 +11,11 @@ from typing import NamedTuple
 # ------------------ #
 
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")  # Characters permitted in a function name
-_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))  # Keywords permitted in function headers
+_FUNCTION_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))
+_MODIFIER_BLOCK_KEYWORDS = frozenset(("align", "anchored", "as", "at", "facing", "in", "on", "positioned", "rotated", "summon"))
+_CONDITION_BLOCK_KEYWORDS = frozenset(("if", "elif", "else", "while"))
+_STORE_BLOCK_KEYWORDS = frozenset(("store",))
+_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | _CONDITION_BLOCK_KEYWORDS | _STORE_BLOCK_KEYWORDS
 
 
 class Line(NamedTuple):
@@ -34,6 +38,7 @@ class BLFatalError(BLError):  # Fatal error, stop compile of this file. Other fi
 @dataclass
 class FileContext:
     local_path: str
+    source_lines: list[Line]
     single_indent: str | None = None
 
 
@@ -43,13 +48,10 @@ class CompiledOutput:
         self.files: dict[str, str] = {}
         self.errors: list[BLError] = []
 
-    # Add a compiled mcfunction file
-    def add_output_file(self, filepath: str, contents: str, source_path: str, function_def: Line) -> None:
+    # Add a compiled mcfunction file.
+    def add_output_file(self, filepath: str, contents: str, function_def_line: Line) -> None:
         if filepath in self.files:
-            err = BLSyntaxError(f"Another function already compiles to '{filepath}'.", function_def)
-            err.filename = source_path
-            self.errors.append(err)
-            return
+            raise BLSyntaxError(f"Another function already compiles to '{filepath}'.", function_def_line)
         self.files[filepath] = contents
 
     # Add a BLError error
@@ -59,23 +61,18 @@ class CompiledOutput:
 
 # Compile a single .bl source file into the shared CompiledOutput.
 def compile_file(compiled_output: CompiledOutput, local_path: str, contents: str) -> None:
-    ctx = FileContext(local_path=local_path)
-    source_lines = split_lines(contents)
-
-    for start_index, end_index in functions_iterator(source_lines):
-        function_def = source_lines[start_index]
-        try:
-            function_files = compile_function(ctx, source_lines, start_index, end_index)
-        except BLFatalError as err:
-            err.filename = local_path
-            compiled_output.add_error(err)
-            return  # Fatal errors are unrecoverable, abandon file
-        except BLSyntaxError as err:
-            err.filename = local_path
-            compiled_output.add_error(err)
-            continue
-        for filepath, file_contents in function_files.items():
-            compiled_output.add_output_file(filepath, file_contents, local_path, function_def)
+    try:
+        ctx = FileContext(local_path=local_path, source_lines=split_lines(contents))
+        detect_indent_schema(ctx)  # settle the file's indent unit before any span is walked
+        for start_index, end_index in span_iterator(ctx, 0, len(ctx.source_lines), 0):
+            try:
+                compile_function(compiled_output, ctx, start_index, end_index)
+            except BLSyntaxError as err:
+                err.filename = local_path
+                compiled_output.add_error(err)  # recoverable: other functions still compile
+    except BLFatalError as err:
+        err.filename = local_path
+        compiled_output.add_error(err)  # unrecoverable: other files still compile
 
 
 # Split lines, maintaining vanilla '\' behavior
@@ -98,24 +95,10 @@ def split_lines(source: str) -> list[Line]:
     return output
 
 
-# Yield line numbers for start (inclusive) and end (exclusive) of functions in the file
-def functions_iterator(source_lines: list[Line]) -> Iterator[tuple[int, int]]:
-    prev_function_start_index: int | None = None
-    for index, line in enumerate(source_lines):
-        if not line.text[:1].isspace():  # any un-indented line starts a function def, validation later
-            if prev_function_start_index is not None:
-                yield prev_function_start_index, index
-            prev_function_start_index = index
-
-    if prev_function_start_index is not None:
-        yield prev_function_start_index, len(source_lines)
-
-
-# Compile a single function
-# Returns dict mapping filepath of mcfunction output file to string of file contents
-def compile_function(ctx: FileContext, source_lines: list[Line], start: int, end: int) -> dict[str, str]:
+# Compile a single function, writing its mcfunction output (and any helpers) into compiled_output.
+def compile_function(compiled_output: CompiledOutput, ctx: FileContext, start: int, end: int) -> None:
     # Validate function header
-    header = source_lines[start]
+    header = ctx.source_lines[start]
     header_split = header.text.split("function ")
     if len(header_split) <= 1:
         raise BLSyntaxError("This is being interpreted as a function header but does not declare a function. Double-check indentation.", header)
@@ -125,12 +108,11 @@ def compile_function(ctx: FileContext, source_lines: list[Line], start: int, end
     # Validate header keywords
     seen_keywords: set[str] = set()
     for word in header_split[0].split():
-        if word not in _HEADER_KEYWORDS:
+        if word not in _FUNCTION_HEADER_KEYWORDS:
             raise BLSyntaxError(f"This function definition declares an unknown keyword: '{word}'", header)
         if word in seen_keywords:
             raise BLSyntaxError(f"This function definition declares '{word}' twice.", header)
         seen_keywords.add(word)
-    is_root = "root" in seen_keywords
 
     # Validate function name
     function_name = header_split[1]
@@ -142,43 +124,80 @@ def compile_function(ctx: FileContext, source_lines: list[Line], start: int, end
     if sorted(set(function_name) - _FUNCTION_NAME_CHARS):
         raise BLSyntaxError("Function names may only use a-z, 0-9, '_' and '-'", header)
 
-    # Determine function filepath
-    function_filepath = f"{function_name}.mcfunction" if is_root else f"{ctx.local_path}/{function_name}.mcfunction"
-
     # Early return on empty functions
     if start + 1 >= end:
-        return {}
+        return
 
-    # If undefined, determine the file's indentation schema using body line 1 (guaranteed to be 1x indent).
-    if ctx.single_indent is None:
-        body_line = source_lines[start + 1]
-        indent = body_line.text[: len(body_line.text) - len(body_line.text.lstrip())]
+    function_filepath = f"{function_name}.mcfunction" if "root" in seen_keywords else f"{ctx.local_path}/{function_name}.mcfunction"
+    compile_block(compiled_output, ctx, start + 1, end, 1, function_filepath)
+
+
+# Walk the body lines in [start, end) at `depth`, building output files from bottom to top.
+def compile_block(compiled_output: CompiledOutput, ctx: FileContext, start: int, end: int, depth: int, output_filepath: str) -> None:
+    output = []
+    for span_start, span_end in span_iterator(ctx, start, end, depth):
+        head = ctx.source_lines[start].text.strip()
+        keyword = head.split(maxsplit=1)[0]  # all blocks begin with single-word keyword
+        has_body = span_end > span_start + 1
+
+        if keyword in _BLOCK_KEYWORDS:
+            if not head.endswith(":"):
+                raise BLSyntaxError(f"'{keyword}' begins a block and must end with ':'.", ctx.source_lines[span_start])
+            if not has_body:
+                raise BLSyntaxError(f"This '{keyword}' block has no body.", ctx.source_lines[span_start])
+            # TODO create block handling here
+            raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", ctx.source_lines[span_start])
+
+        elif has_body:
+            raise BLSyntaxError("Only block keywords may begin an indented block.", ctx.source_lines[span_start + 1])
+
+        output.append(head)
+
+    compiled_output.add_output_file(output_filepath, "\n".join(output), ctx.source_lines[start - 1])
+
+
+# Yield (start, end) line-index spans (end exclusive) for each statement sitting at exactly `indentation_depth`
+def span_iterator(ctx: FileContext, start_index: int, end_index: int, indentation_depth: int) -> Iterator[tuple[int, int]]:
+    if start_index >= end_index:
+        return
+
+    expected_indent = "" if indentation_depth == 0 else ctx.single_indent * indentation_depth
+    expected_indent_len = len(expected_indent)
+
+    # The first line must sit exactly at the expected depth
+    first_line = ctx.source_lines[start_index]
+    if first_line.text[expected_indent_len:expected_indent_len+1].isspace():
+        if indentation_depth == 0:
+            raise BLFatalError("This file must begin with a function definition.", first_line)
+        raise BLSyntaxError("This line is over-indented.", first_line)
+
+    prev_span_start: int | None = None
+    for index in range(start_index, end_index):
+        line = ctx.source_lines[index]
+        if not line.text.startswith(expected_indent):
+            raise BLSyntaxError("This line is under-indented.", line)
+        if not line.text[expected_indent_len:expected_indent_len+1].isspace():
+            if prev_span_start is not None:
+                yield prev_span_start, index
+            prev_span_start = index
+
+    if prev_span_start is not None:
+        yield prev_span_start, end_index
+
+
+# Set ctx.single_indent from the first indented line in the file. That line is always exactly one
+# level deep, since any shallower parent would be encountered first.
+def detect_indent_schema(ctx: FileContext) -> None:
+    for line in ctx.source_lines:
+        indent = line.text[: len(line.text) - len(line.text.lstrip())]
+        if not indent:
+            continue
         if " " in indent and "\t" in indent:
-            raise BLFatalError("This file's detected indentation schema mixes tabs and spaces, which is not permitted.", body_line)
+            raise BLFatalError("This file's detected indentation schema mixes tabs and spaces, which is not permitted.", line)
         if indent == " ":
-            raise BLFatalError("This file's indentation schema must be at least two spaces per indent.", body_line)
+            raise BLFatalError("This file's indentation schema must be at least two spaces per indent.", line)
         ctx.single_indent = indent
-
-    # Walk the function body, validating indentation.
-    contents = ""
-    for i in range(start + 1, end):
-        line = strip_indent(ctx, source_lines, i, 1)
-        # TODO add ALL block keyword detection stuff here
-        contents += line + "\n"
-
-    return {function_filepath: contents}
-
-
-# Validate that the supplied line is correctly indented, return the left stripped string
-def strip_indent(ctx: FileContext, source_lines: list[Line], line_number: int, indentation_depth: int) -> str:
-    line = source_lines[line_number]
-    expected = ctx.single_indent * indentation_depth
-    if not line.text.startswith(expected):
-        raise BLSyntaxError("This line is under-indented.", line)
-    remainder = line.text[len(expected):]
-    if remainder[:1].isspace():
-        raise BLSyntaxError("This line is over-indented", line)
-    return remainder
+        return
 
 
 # ------------- #
