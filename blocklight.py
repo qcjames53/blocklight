@@ -136,7 +136,7 @@ def compile_function(compiled_output: CompiledOutput, ctx: FileContext, start: i
 def compile_block(compiled_output: CompiledOutput, ctx: FileContext, start: int, end: int, depth: int, output_filepath: str) -> None:
     output = []
     for span_start, span_end in span_iterator(ctx, start, end, depth):
-        head = ctx.source_lines[start].text.strip()
+        head = ctx.source_lines[span_start].text.strip()
         keyword = head.split(maxsplit=1)[0]  # all blocks begin with single-word keyword
         has_body = span_end > span_start + 1
 
