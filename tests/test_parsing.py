@@ -41,4 +41,6 @@ function c:
 
 def test_functions_iterator_no_functions():
     assert list(blocklight.functions_iterator(blocklight.split_lines(""))) == []
-    assert blocklight.compile_file("blank", "") == ([], [])
+    out = blocklight.CompiledOutput()
+    blocklight.compile_file(out, "blank", "")
+    assert out.files == {} and out.errors == []
