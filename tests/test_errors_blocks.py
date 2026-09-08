@@ -55,19 +55,6 @@ function hello:
     assert out.files == {}
 
 
-def test_store_block_not_yet_implemented():
-    out = blocklight.CompiledOutput()
-    blocklight.compile_file(out, "pack", """\
-function hello:
-    store result score @s tmp:
-        say hi
-""")
-    assert len(out.errors) == 1
-    assert isinstance(out.errors[0], blocklight.BLSyntaxError)
-    assert out.errors[0].lineno == 2
-    assert out.files == {}
-
-
 def test_plain_statement_may_not_open_an_indented_block():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(out, "pack", """\

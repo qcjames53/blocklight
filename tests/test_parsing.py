@@ -14,7 +14,7 @@ def test_split_lines():
         "        line 7\n"
         "\tline 8\n"
     )
-    assert blocklight.split_lines(source) == [
+    assert blocklight._split_lines(source) == [
         ("line 2", 2),
         ("    line 3", 3),
         ("line 5 line 6 line 7", 5),
@@ -31,8 +31,8 @@ function b:
 function c:
     foo
 """)
-    ctx = blocklight.FileContext(local_path="foo", source_lines=blocklight.split_lines(source))
-    assert list(blocklight.span_iterator(ctx, 0, len(ctx.source_lines), 0)) == [
+    ctx = blocklight._FileContext(local_path="foo", source_lines=blocklight._split_lines(source))
+    assert list(blocklight._iter_spans(ctx, 0, len(ctx.source_lines), 0)) == [
         (0, 3),
         (3, 4),
         (4, 6),
@@ -40,8 +40,8 @@ function c:
 
 
 def test_span_iterator_no_functions():
-    ctx = blocklight.FileContext(local_path="foo", source_lines=blocklight.split_lines(""))
-    assert list(blocklight.span_iterator(ctx, 0, len(ctx.source_lines), 0)) == []
+    ctx = blocklight._FileContext(local_path="foo", source_lines=blocklight._split_lines(""))
+    assert list(blocklight._iter_spans(ctx, 0, len(ctx.source_lines), 0)) == []
     out = blocklight.CompiledOutput()
     blocklight.compile_file(out, "blank", "")
     assert out.files == {} and out.errors == []

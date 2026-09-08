@@ -11,20 +11,20 @@ from typing import NamedTuple
 # ------------------ #
 
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")  # Characters permitted in a function name
+_MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")  # Characters permitted in a macro name
 _FUNCTION_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))
 _MODIFIER_BLOCK_KEYWORDS = frozenset(("align", "anchored", "as", "at", "facing", "in", "on", "positioned", "rotated", "summon"))
 _CONDITION_BLOCK_KEYWORDS = frozenset(("if", "elif", "else", "while"))
-_STORE_BLOCK_KEYWORDS = frozenset(("store",))
-_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | _CONDITION_BLOCK_KEYWORDS | _STORE_BLOCK_KEYWORDS
+_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | _CONDITION_BLOCK_KEYWORDS
 
 
-class Line(NamedTuple):
+class _Line(NamedTuple):
     text: str
     lineno: int
 
 
 class BLError(SyntaxError):
-    def __init__(self, msg: str, line: Line | None = None):
+    def __init__(self, msg: str, line: _Line | None = None):
         super().__init__(msg)
         if line is not None:
             self.lineno = line.lineno
@@ -36,9 +36,15 @@ class BLFatalError(BLError):  # Fatal error, stop compile of this file. Other fi
 
 
 @dataclass
-class FileContext:
+class _CompiledBlockProperties:
+    macros: set[str]  # Vanilla macros the compiled block may use
+    can_return: bool  # Can the compiled block early return?
+
+
+@dataclass
+class _FileContext:
     local_path: str
-    source_lines: list[Line]
+    source_lines: list[_Line]
     single_indent: str | None = None
 
 
@@ -47,26 +53,43 @@ class CompiledOutput:
     def __init__(self) -> None:
         self.files: dict[str, str] = {}
         self.errors: list[BLError] = []
+        self.load_functions: set[str] = set()
+        self.tick_functions: set[str] = set()
+        self.required_scoreboards: dict[str, dict[str, int]] = {
+            "__bl_const": {},
+            "__bl_var": {}
+        }
 
     # Add a compiled mcfunction file.
-    def add_output_file(self, filepath: str, contents: str, function_def_line: Line) -> None:
+    def add_output_file(self, filepath: str, contents: str, function_def_line: _Line) -> None:
         if filepath in self.files:
             raise BLSyntaxError(f"Another function already compiles to '{filepath}'.", function_def_line)
         self.files[filepath] = contents
 
-    # Add a BLError error
     def add_error(self, error: BLError) -> None:
         self.errors.append(error)
+
+    def add_load_function(self, function_output_filepath: str):
+        self.load_functions.add(function_output_filepath)
+
+    def add_tick_function(self, function_output_filepath: str):
+        self.tick_functions.add(function_output_filepath)
+
+    def add_internal_constant(self, selector: str, value: int):
+        self.required_scoreboards["__bl_const"][selector] = value
+
+    def add_internal_var(self, selector: str, init_value: int):
+        self.required_scoreboards["__bl_var"][selector] = init_value
 
 
 # Compile a single .bl source file into the shared CompiledOutput.
 def compile_file(compiled_output: CompiledOutput, local_path: str, contents: str) -> None:
     try:
-        ctx = FileContext(local_path=local_path, source_lines=split_lines(contents))
-        detect_indent_schema(ctx)  # settle the file's indent unit before any span is walked
-        for start_index, end_index in span_iterator(ctx, 0, len(ctx.source_lines), 0):
+        ctx = _FileContext(local_path=local_path, source_lines=_split_lines(contents))
+        _detect_indent_schema(ctx)  # settle the file's indent unit before any span is walked
+        for start_index, end_index in _iter_spans(ctx, 0, len(ctx.source_lines), 0):
             try:
-                compile_function(compiled_output, ctx, start_index, end_index)
+                _compile_function(compiled_output, ctx, start_index, end_index)
             except BLSyntaxError as err:
                 err.filename = local_path
                 compiled_output.add_error(err)  # recoverable: other functions still compile
@@ -77,8 +100,8 @@ def compile_file(compiled_output: CompiledOutput, local_path: str, contents: str
 
 # Split lines, maintaining vanilla '\' behavior
 # Returns cleaned list of Line(text, source line number)
-def split_lines(source: str) -> list[Line]:
-    output: list[Line] = []
+def _split_lines(source: str) -> list[_Line]:
+    output: list[_Line] = []
     for line_number, line in enumerate(source.split("\n"), start=1):
         line = line.rstrip()
         lstrip_line = line.lstrip()
@@ -89,14 +112,57 @@ def split_lines(source: str) -> list[Line]:
 
         if output and output[-1].text.endswith("\\"):
             prev = output[-1]
-            output[-1] = Line(prev.text[:-1] + lstrip_line, prev.lineno)
+            output[-1] = _Line(prev.text[:-1] + lstrip_line, prev.lineno)
         else:
-            output.append(Line(line, line_number))
+            output.append(_Line(line, line_number))
     return output
 
 
+# Set ctx.single_indent from the first indented line in the file (guaranteed to be x1 indent)
+def _detect_indent_schema(ctx: _FileContext) -> None:
+    for line in ctx.source_lines:
+        indent = line.text[: len(line.text) - len(line.text.lstrip())]
+        if not indent:
+            continue
+        if " " in indent and "\t" in indent:
+            raise BLFatalError("This file's detected indentation schema mixes tabs and spaces, which is not permitted.", line)
+        if indent == " ":
+            raise BLFatalError("This file's indentation schema must be at least two spaces per indent.", line)
+        ctx.single_indent = indent
+        return
+
+
+# Yield (start, end) line-index spans (end exclusive) for each statement sitting at exactly `indentation_depth`
+def _iter_spans(ctx: _FileContext, start_index: int, end_index: int, indentation_depth: int) -> Iterator[tuple[int, int]]:
+    if start_index >= end_index:
+        return
+
+    expected_indent = "" if indentation_depth == 0 else ctx.single_indent * indentation_depth
+    expected_indent_len = len(expected_indent)
+
+    # The first line must sit exactly at the expected depth
+    first_line = ctx.source_lines[start_index]
+    if first_line.text[expected_indent_len:expected_indent_len+1].isspace():
+        if indentation_depth == 0:
+            raise BLFatalError("This file must begin with a function definition.", first_line)
+        raise BLSyntaxError("This line is over-indented.", first_line)
+
+    prev_span_start: int | None = None
+    for index in range(start_index, end_index):
+        line = ctx.source_lines[index]
+        if not line.text.startswith(expected_indent):
+            raise BLSyntaxError("This line is under-indented.", line)
+        if not line.text[expected_indent_len:expected_indent_len+1].isspace():
+            if prev_span_start is not None:
+                yield prev_span_start, index
+            prev_span_start = index
+
+    if prev_span_start is not None:
+        yield prev_span_start, end_index
+
+
 # Compile a single function, writing its mcfunction output (and any helpers) into compiled_output.
-def compile_function(compiled_output: CompiledOutput, ctx: FileContext, start: int, end: int) -> None:
+def _compile_function(compiled_output: CompiledOutput, ctx: _FileContext, start: int, end: int) -> None:
     # Validate function header
     header = ctx.source_lines[start]
     header_split = header.text.split("function ")
@@ -129,75 +195,74 @@ def compile_function(compiled_output: CompiledOutput, ctx: FileContext, start: i
         return
 
     function_filepath = f"{function_name}.mcfunction" if "root" in seen_keywords else f"{ctx.local_path}/{function_name}.mcfunction"
-    compile_block(compiled_output, ctx, start + 1, end, 1, function_filepath)
+    _compile_block(compiled_output, ctx, function_filepath, start + 1, end, 1)  # start + 1 since we don't walk the header
+
+    if "load" in seen_keywords:
+        compiled_output.add_load_function(function_filepath)
+    if "tick" in seen_keywords:
+        compiled_output.add_tick_function(function_filepath)
 
 
-# Walk the body lines in [start, end) at `depth`, building output files from bottom to top.
-def compile_block(compiled_output: CompiledOutput, ctx: FileContext, start: int, end: int, depth: int, output_filepath: str) -> None:
-    output = []
-    for span_start, span_end in span_iterator(ctx, start, end, depth):
-        head = ctx.source_lines[span_start].text.strip()
-        keyword = head.split(maxsplit=1)[0]  # all blocks begin with single-word keyword
+# Recursively compile a portion of the file.
+# Returns CompiledBlockProperties which pass used macros and whether this function may return a value
+def _compile_block(compiled_output: CompiledOutput, ctx: _FileContext, output_filepath: str, start: int, end: int, 
+                   depth: int) -> _CompiledBlockProperties:
+    return_props = _CompiledBlockProperties(can_return=False, macros=set())
+    output_lines: list[str] = []
+
+    # Iterate over every line at this indentation, skipping blocks of deeper indentation
+    for span_start, span_end in _iter_spans(ctx, start, end, depth):
+        line = ctx.source_lines[span_start]
+        text = line.text.lstrip()  # right is already stripped
+        keyword = text.split(maxsplit=1)[0]  # all blocks begin with single-word keyword
         has_body = span_end > span_start + 1
 
         if keyword in _BLOCK_KEYWORDS:
-            if not head.endswith(":"):
-                raise BLSyntaxError(f"'{keyword}' begins a block and must end with ':'.", ctx.source_lines[span_start])
+            if not text.endswith(":"):
+                raise BLSyntaxError(f"'{keyword}' begins a block and must end with ':'.", line)
             if not has_body:
-                raise BLSyntaxError(f"This '{keyword}' block has no body.", ctx.source_lines[span_start])
+                raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
             # TODO create block handling here
-            raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", ctx.source_lines[span_start])
-
+            raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
         elif has_body:
             raise BLSyntaxError("Only block keywords may begin an indented block.", ctx.source_lines[span_start + 1])
+        elif not return_props.can_return:  # Detect possiblity of early return in regular non-block commands
+            # This will still have a few false positives but `can_return` doesn't have to mean `will_return` :)
+            return_loc = text.find("return")
+            if return_loc != -1 and \
+                    (return_loc == 0 or text[return_loc - 1] == ' ') and \
+                    (len(text) <= return_loc + 6 or text[return_loc + 6] == ' '):
+                return_props.can_return = True
 
-        output.append(head)
+        # Record vanilla macros to return_props + prepend '$' to the line if it is missing.
+        has_dollar = text.startswith("$")
+        uses_macro = False
+        if "$(" in text:
+            for macro_name in _iter_macro_names(line):
+                return_props.macros.add(macro_name)
+                uses_macro = True
+        if not uses_macro and has_dollar:
+            raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
+        output_lines.append("$" + text if uses_macro and not has_dollar else text)
 
-    compiled_output.add_output_file(output_filepath, "\n".join(output), ctx.source_lines[start - 1])
-
-
-# Yield (start, end) line-index spans (end exclusive) for each statement sitting at exactly `indentation_depth`
-def span_iterator(ctx: FileContext, start_index: int, end_index: int, indentation_depth: int) -> Iterator[tuple[int, int]]:
-    if start_index >= end_index:
-        return
-
-    expected_indent = "" if indentation_depth == 0 else ctx.single_indent * indentation_depth
-    expected_indent_len = len(expected_indent)
-
-    # The first line must sit exactly at the expected depth
-    first_line = ctx.source_lines[start_index]
-    if first_line.text[expected_indent_len:expected_indent_len+1].isspace():
-        if indentation_depth == 0:
-            raise BLFatalError("This file must begin with a function definition.", first_line)
-        raise BLSyntaxError("This line is over-indented.", first_line)
-
-    prev_span_start: int | None = None
-    for index in range(start_index, end_index):
-        line = ctx.source_lines[index]
-        if not line.text.startswith(expected_indent):
-            raise BLSyntaxError("This line is under-indented.", line)
-        if not line.text[expected_indent_len:expected_indent_len+1].isspace():
-            if prev_span_start is not None:
-                yield prev_span_start, index
-            prev_span_start = index
-
-    if prev_span_start is not None:
-        yield prev_span_start, end_index
+    compiled_output.add_output_file(output_filepath, "\n".join(output_lines), ctx.source_lines[start - 1])
+    return return_props
 
 
-# Set ctx.single_indent from the first indented line in the file. That line is always exactly one
-# level deep, since any shallower parent would be encountered first.
-def detect_indent_schema(ctx: FileContext) -> None:
-    for line in ctx.source_lines:
-        indent = line.text[: len(line.text) - len(line.text.lstrip())]
-        if not indent:
-            continue
-        if " " in indent and "\t" in indent:
-            raise BLFatalError("This file's detected indentation schema mixes tabs and spaces, which is not permitted.", line)
-        if indent == " ":
-            raise BLFatalError("This file's indentation schema must be at least two spaces per indent.", line)
-        ctx.single_indent = indent
-        return
+# Yield the name inside each vanilla macro '$(name)' in line, left to right.
+def _iter_macro_names(line: _Line) -> Iterator[str]:
+    search_from = 0
+    while (name_start := line.text.find("$(", search_from)) != -1:
+        name_end = line.text.find(")", name_start + 2)
+        if name_end == -1:
+            raise BLSyntaxError("This line opens a macro with '$(' but never closes it with ')'.", line)
+        name = line.text[name_start + 2:name_end]
+        if not name:
+            raise BLSyntaxError("This line declares an empty macro '$()'.", line)
+        if set(name) - _MACRO_NAME_CHARS:
+            raise BLSyntaxError(f"Macro names may only use a-z, A-Z, 0-9 and '_': '$({name})'", line)
+        yield name
+        search_from = name_end + 1
 
 
 # ------------- #
