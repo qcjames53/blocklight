@@ -6,3 +6,4 @@ __pycache__/
 .claude/
 .venv/
 venv/
+.ruff_cache/

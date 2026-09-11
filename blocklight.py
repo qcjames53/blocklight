@@ -1,5 +1,6 @@
 """Blocklight - A blazing fast mcfunction microcompiler"""
 
+import argparse
 import string
 import sys
 import textwrap
@@ -8,9 +9,8 @@ from dataclasses import InitVar, dataclass, field
 from functools import cached_property
 from typing import NamedTuple
 
-# ------------------ #
-# Compiler functions #
-# ------------------ #
+_BL_VERSION = "1.0.dev"
+_MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
 
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
 _MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")
@@ -19,7 +19,6 @@ _MODIFIER_BLOCK_KEYWORDS = frozenset(
     ("align", "anchored", "as", "at", "facing", "in", "on", "positioned", "rotated", "summon")
 )
 _CONDITION_BLOCK_KEYWORDS = frozenset(("if", "elif", "else", "while"))
-# Every keyword that begins an indented block. `python` runs at compile time; the rest still raise as not-implemented.
 _BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | _CONDITION_BLOCK_KEYWORDS | {"python"}
 
 
@@ -132,18 +131,26 @@ class CompiledOutput:
         self.required_scoreboards["__bl_var"][selector] = init_value
 
 
+# Compile-time options
+@dataclass(frozen=True)
+class CompilerOptions:
+    no_header: bool = False  # Omit the "Compiled by Blocklight" header comment from each output file
+    no_python: bool = False  # Throw an error on `python:` blocks instead of executing them
+
+
 # Read-only context threaded through the compilation of one function.
 @dataclass
 class _BlockInput:
     sf: SourceFile
     function_name: str
+    options: CompilerOptions
 
 
 # Mutable accumulator built up while compiling a function body.
 @dataclass
 class _BlockOutput:
-    lines: list[str] = field(default_factory=list)  # compiled mcfunction command lines
-    macros: set[str] = field(default_factory=set)  # vanilla macros the block may use
+    lines: list[str] = field(default_factory=list[str])  # compiled mcfunction command lines
+    macros: set[str] = field(default_factory=set[str])  # vanilla macros the block may use
     can_return: bool = False  # whether the block may early-return
 
 
@@ -161,11 +168,11 @@ class _PythonBlockContext:
 
 
 # Compile a single .bl source file into the shared CompiledOutput.
-def compile_file(sf: SourceFile, compiled_output: CompiledOutput) -> None:
+def compile_file(sf: SourceFile, compiled_output: CompiledOutput, options: CompilerOptions) -> None:
     try:
         for function_lines in _iter_spans(sf.source_lines, sf.single_indent, 0):
             try:
-                _compile_function(compiled_output, sf, function_lines)
+                _compile_function(sf, compiled_output, options, function_lines)
             except BLSyntaxError as err:
                 err.filename = sf.local_path
                 compiled_output.add_error(err)  # recoverable: other functions still compile
@@ -197,7 +204,9 @@ def _iter_spans(lines: list[_Line], single_indent: str, depth: int) -> Iterator[
 
 
 # Validate a function header and compile its body to an mcfunction file.
-def _compile_function(compiled_output: CompiledOutput, sf: SourceFile, lines: list[_Line]) -> None:
+def _compile_function(
+    sf: SourceFile, compiled_output: CompiledOutput, options: CompilerOptions, lines: list[_Line]
+) -> None:
     header = lines[0]
     header_split = header.text.split("function ")
     if len(header_split) <= 1:
@@ -230,13 +239,20 @@ def _compile_function(compiled_output: CompiledOutput, sf: SourceFile, lines: li
     if len(lines) == 1:  # header only: empty function produces no output
         return
 
+    _data, namespace, _src_root, *subdirs, source_file = sf.local_path.split("/")  # /data/<ns>/blocklight/*/source.bl
+    function_dir = f"data/{namespace}/function"
     if "root" in seen_keywords:
-        output_filepath = f"{function_name}.mcfunction"
+        output_filepath = f"{function_dir}/{function_name}.mcfunction"
     else:
-        output_filepath = f"{sf.local_path}/{function_name}.mcfunction"
+        nested_dir = "/".join([*subdirs, source_file.removesuffix(".bl")])
+        output_filepath = f"{function_dir}/{nested_dir}/{function_name}.mcfunction"
 
     block_out = _BlockOutput()
-    _compile_lines(_BlockInput(sf, function_name), block_out, lines[1:], 1)
+    if not options.no_header:
+        block_out.lines.append(f"# Compiled by Blocklight {_BL_VERSION} (https://github.com/qcjames53/blocklight)")
+        block_out.lines.append("# Changes saved to this file will not persist. Please modify the source file instead:")
+        block_out.lines.append(f"#     `{sf.local_path}`")
+    _compile_lines(_BlockInput(sf, function_name, options), block_out, lines[1:], 1)
     compiled_output.add_output_file(output_filepath, "\n".join(block_out.lines), header)
 
     if "load" in seen_keywords:
@@ -260,6 +276,10 @@ def _compile_lines(block_in: _BlockInput, block_out: _BlockOutput, lines: list[_
             if not has_body:
                 raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
             if keyword == "python":
+                if block_in.options.no_python:
+                    raise BLSyntaxError(
+                        "This 'python:' block is not allowed because python blocks are disabled (--no-python).", line
+                    )
                 if text != "python:":
                     raise BLSyntaxError("A 'python:' block header takes no arguments.", line)
                 _compile_lines(block_in, block_out, _run_python_block(block_in, span, depth), depth)
@@ -317,7 +337,11 @@ def _run_python_block(block_in: _BlockInput, span: list[_Line], depth: int) -> l
     body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
 
     emitted: list[str] = []
-    scope = {"emit": lambda command: emitted.append(str(command)), "bl": _PythonBlockContext(block_in)}
+
+    def emit(command: object) -> None:
+        emitted.append(str(command))
+
+    scope: dict[str, object] = {"emit": emit, "bl": _PythonBlockContext(block_in)}
     try:
         exec(compile(body, f"{sf.local_path}:{head.lineno} python: block", "exec"), scope)
     except SyntaxError as err:
@@ -331,18 +355,27 @@ def _run_python_block(block_in: _BlockInput, span: list[_Line], depth: int) -> l
     ]
 
 
-# ------------- #
-# I/O functions #
-# ------------- #
-
-_BL_VERSION = "1.0.dev"
-_MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
-
-
 def main():
     if sys.version_info < _MIN_PYTHON:
         required = ".".join(str(part) for part in _MIN_PYTHON)
         raise SystemExit(f"Blocklight {_BL_VERSION} requires Python {required} or newer.")
+
+    parser = argparse.ArgumentParser(prog="blocklight", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"Blocklight {_BL_VERSION}")
+    parser.add_argument(
+        "--no-header",
+        action="store_true",
+        help='omit the "Compiled by Blocklight" header comment from each output file',
+    )
+    parser.add_argument(
+        "--no-python", action="store_true", help="reject 'python:' blocks instead of executing them at compile time"
+    )
+    args = parser.parse_args()
+
+    options = CompilerOptions(no_header=args.no_header, no_python=args.no_python)
+
+    # TODO: discover source files and compile each with compile_file(sf, compiled_output, options), concurrently.
+    _ = options
 
 
 if __name__ == "__main__":
