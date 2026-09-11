@@ -230,10 +230,13 @@ def _compile_function(compiled_output: CompiledOutput, sf: SourceFile, lines: li
     if len(lines) == 1:  # header only: empty function produces no output
         return
 
+    _data, namespace, _src_root, *subdirs, source_file = sf.local_path.split("/")  # will be /data/<ns>/blocklight/*/source.bl
+    function_dir = f"data/{namespace}/function"
     if "root" in seen_keywords:
-        output_filepath = f"{function_name}.mcfunction"
+        output_filepath = f"{function_dir}/{function_name}.mcfunction"
     else:
-        output_filepath = f"{sf.local_path}/{function_name}.mcfunction"
+        nested_dir = "/".join([*subdirs, source_file.removesuffix(".bl")])
+        output_filepath = f"{function_dir}/{nested_dir}/{function_name}.mcfunction"
 
     block_out = _BlockOutput()
     _compile_lines(_BlockInput(sf, function_name), block_out, lines[1:], 1)

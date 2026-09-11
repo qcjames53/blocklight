@@ -7,7 +7,7 @@ def test_basic_function():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function hello:
     say Hello, world!
@@ -16,14 +16,14 @@ function hello:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/hello.mcfunction": "say Hello, world!"}
+    assert out.files == {"data/hello_world/function/main/hello.mcfunction": "say Hello, world!"}
 
 
 def test_basic_root_function():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 root function hello:
     say Hello, world!
@@ -32,14 +32,14 @@ root function hello:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello.mcfunction": "say Hello, world!"}
+    assert out.files == {"data/hello_world/function/hello.mcfunction": "say Hello, world!"}
 
 
 def test_basic_function_filepath():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="foo/bar/baz",
+            local_path="data/foo/blocklight/bar/baz.bl",
             source="""\
 function hello:
     say Hello, world!
@@ -48,14 +48,14 @@ function hello:
         out,
     )
     assert out.errors == []
-    assert out.files == {"foo/bar/baz/hello.mcfunction": "say Hello, world!"}
+    assert out.files == {"data/foo/function/bar/baz/hello.mcfunction": "say Hello, world!"}
 
 
 def test_function_funky_name():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function abcdefghijklmnopqrstuvwxyz_-0123456789:
     say Hello, world!
@@ -64,14 +64,16 @@ function abcdefghijklmnopqrstuvwxyz_-0123456789:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/abcdefghijklmnopqrstuvwxyz_-0123456789.mcfunction": "say Hello, world!"}
+    assert out.files == {
+        "data/hello_world/function/main/abcdefghijklmnopqrstuvwxyz_-0123456789.mcfunction": "say Hello, world!"
+    }
 
 
 def test_multi_statement_body():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function hello:
     say one
@@ -82,14 +84,14 @@ function hello:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/hello.mcfunction": "say one\nsay two\nsay three"}
+    assert out.files == {"data/hello_world/function/main/hello.mcfunction": "say one\nsay two\nsay three"}
 
 
 def test_load_keyword_accepted():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 load function setup:
     say loading
@@ -98,14 +100,14 @@ load function setup:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/setup.mcfunction": "say loading"}
+    assert out.files == {"data/hello_world/function/main/setup.mcfunction": "say loading"}
 
 
 def test_tick_keyword_accepted():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 tick function loop:
     say ticking
@@ -114,14 +116,14 @@ tick function loop:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/loop.mcfunction": "say ticking"}
+    assert out.files == {"data/hello_world/function/main/loop.mcfunction": "say ticking"}
 
 
 def test_multiple_header_keywords():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 root load function setup:
     say loading
@@ -130,14 +132,14 @@ root load function setup:
         out,
     )
     assert out.errors == []
-    assert out.files == {"setup.mcfunction": "say loading"}
+    assert out.files == {"data/hello_world/function/setup.mcfunction": "say loading"}
 
 
 def test_line_continuation_in_body():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function hello:
     say the quick \\
@@ -147,14 +149,14 @@ function hello:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/hello.mcfunction": "say the quick brown fox"}
+    assert out.files == {"data/hello_world/function/main/hello.mcfunction": "say the quick brown fox"}
 
 
 def test_comments_and_blank_lines_ignored_in_body():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function hello:
     # a leading note
@@ -167,14 +169,14 @@ function hello:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/hello.mcfunction": "say one\nsay two"}
+    assert out.files == {"data/hello_world/function/main/hello.mcfunction": "say one\nsay two"}
 
 
 def test_error_line_numbers_count_blank_and_comment_lines():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function hello:
     say one
@@ -194,15 +196,18 @@ function hello:
 def test_tab_indentation_allowed():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
-        blocklight.SourceFile(local_path="hello_world", source="function hello:\n\tsay one\n\tsay two\n"), out
+        blocklight.SourceFile(
+            local_path="data/hello_world/blocklight/main.bl", source="function hello:\n\tsay one\n\tsay two\n"
+        ),
+        out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/hello.mcfunction": "say one\nsay two"}
+    assert out.files == {"data/hello_world/function/main/hello.mcfunction": "say one\nsay two"}
 
 
 def test_empty_file_produces_no_output():
     out = blocklight.CompiledOutput()
-    blocklight.compile_file(blocklight.SourceFile(local_path="hello_world", source=""), out)
+    blocklight.compile_file(blocklight.SourceFile(local_path="data/hello_world/blocklight/main.bl", source=""), out)
     assert out.errors == []
     assert out.files == {}
 
@@ -211,7 +216,7 @@ def test_empty_function_produces_no_output():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function a:
 function b:
@@ -221,7 +226,7 @@ function b:
         out,
     )
     assert out.errors == []
-    assert out.files == {"hello_world/b.mcfunction": "say Hello, world!"}
+    assert out.files == {"data/hello_world/function/main/b.mcfunction": "say Hello, world!"}
 
 
 def test_syntax_error_isolation():
@@ -229,7 +234,7 @@ def test_syntax_error_isolation():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function one:
     say Hello, world!
@@ -242,7 +247,7 @@ function two:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 4
-    assert out.files == {"hello_world/one.mcfunction": "say Hello, world!"}
+    assert out.files == {"data/hello_world/function/main/one.mcfunction": "say Hello, world!"}
 
 
 def test_fatal_error_prevents_all_output():
@@ -250,7 +255,7 @@ def test_fatal_error_prevents_all_output():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function one:
  say Hello, world!
@@ -270,7 +275,7 @@ def test_errors_carry_filename_and_source_text():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function one:
     say Hello, world!
@@ -282,7 +287,7 @@ function two:
     )
     assert len(out.errors) == 1
     err = out.errors[0]
-    assert err.filename == "hello_world"
+    assert err.filename == "data/hello_world/blocklight/main.bl"
     assert err.lineno == 4
     assert err.text == "     say Hello, world!"
 
@@ -291,7 +296,7 @@ def test_fatal_error_carries_filename_and_source_text():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="hello_world",
+            local_path="data/hello_world/blocklight/main.bl",
             source="""\
 function one:
  say Hello, world!
@@ -301,6 +306,6 @@ function one:
     )
     assert len(out.errors) == 1
     err = out.errors[0]
-    assert err.filename == "hello_world"
+    assert err.filename == "data/hello_world/blocklight/main.bl"
     assert err.lineno == 2
     assert err.text == " say Hello, world!"

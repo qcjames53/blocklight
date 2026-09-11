@@ -5,7 +5,7 @@ import blocklight
 
 def _context(source):
     return blocklight.SourceFile(
-        local_path="bl_example/blocklight/python",
+        local_path="data/bl_example/blocklight/python.bl",
         source=source,
         pack_name="example_pack",
         pack_format=107,
@@ -26,7 +26,7 @@ function hardcode_example:
     )
     assert out.errors == []
     assert out.files == {
-        "bl_example/blocklight/python/hardcode_example.mcfunction": "say hi\nsay hi\nsay hi",
+        "data/bl_example/function/python/hardcode_example.mcfunction": "say hi\nsay hi\nsay hi",
     }
 
 
@@ -44,7 +44,7 @@ function grid:
     )
     assert out.errors == []
     assert out.files == {
-        "bl_example/blocklight/python/grid.mcfunction": (
+        "data/bl_example/function/python/grid.mcfunction": (
             "setblock ~ ~ ~ stone\nsetblock ~1 ~ ~ stone\nsetblock ~2 ~ ~ stone"
         ),
     }
@@ -64,7 +64,7 @@ function mixed:
     )
     assert out.errors == []
     assert out.files == {
-        "bl_example/blocklight/python/mixed.mcfunction": "say before\nsay from python\nsay after",
+        "data/bl_example/function/python/mixed.mcfunction": "say before\nsay from python\nsay after",
     }
 
 
@@ -103,16 +103,16 @@ function locators_example:
     assert out.errors == []
     expected = "\n".join(
         [
-            "say Relative filepath: 'bl_example/blocklight/python'",
+            "say Relative filepath: 'data/bl_example/blocklight/python.bl'",
             "say Datapack name: 'example_pack'",
             "say Datapack format: '107'",
             "say Namespace: 'bl_example'",
-            "say Source file: 'python'",
+            "say Source file: 'python.bl'",
             "say Function name: 'locators_example'",
             f"say Blocklight version: '{blocklight._BL_VERSION}'",
         ]
     )
-    assert out.files == {"bl_example/blocklight/python/locators_example.mcfunction": expected}
+    assert out.files == {"data/bl_example/function/python/locators_example.mcfunction": expected}
 
 
 def test_python_block_emitted_commands_get_macro_handling():
@@ -126,7 +126,7 @@ function macro_emit:
         out,
     )
     assert out.errors == []
-    assert out.files == {"bl_example/blocklight/python/macro_emit.mcfunction": "$say hi $(name)"}
+    assert out.files == {"data/bl_example/function/python/macro_emit.mcfunction": "$say hi $(name)"}
 
 
 def test_invalid_python_is_reported_as_bl_python_error():
@@ -160,7 +160,7 @@ function fine:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLPythonError)
     # the well-formed function still compiles
-    assert out.files == {"bl_example/blocklight/python/fine.mcfunction": "say ok"}
+    assert out.files == {"data/bl_example/function/python/fine.mcfunction": "say ok"}
 
 
 def test_python_block_that_emits_nothing_produces_an_empty_function():
@@ -174,7 +174,7 @@ function silent:
         out,
     )
     assert out.errors == []
-    assert out.files == {"bl_example/blocklight/python/silent.mcfunction": ""}
+    assert out.files == {"data/bl_example/function/python/silent.mcfunction": ""}
 
 
 def test_emitted_output_is_recompiled_as_blocklight_source():

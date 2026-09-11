@@ -22,7 +22,7 @@ function b:
 function c:
     foo
 """
-    ctx = blocklight.SourceFile(local_path="foo", source=source)
+    ctx = blocklight.SourceFile(local_path="data/foo/blocklight/main.bl", source=source)
     assert list(blocklight._iter_spans(ctx.source_lines, ctx.single_indent, 0)) == [
         [("function a:", 1), ("    foo", 2), ("    bar", 3)],
         [("function b:", 4)],
@@ -31,8 +31,8 @@ function c:
 
 
 def test_span_iterator_no_functions():
-    ctx = blocklight.SourceFile(local_path="foo", source="")
+    ctx = blocklight.SourceFile(local_path="data/foo/blocklight/main.bl", source="")
     assert list(blocklight._iter_spans(ctx.source_lines, ctx.single_indent, 0)) == []
     out = blocklight.CompiledOutput()
-    blocklight.compile_file(blocklight.SourceFile(local_path="blank", source=""), out)
+    blocklight.compile_file(blocklight.SourceFile(local_path="data/blank/blocklight/main.bl", source=""), out)
     assert out.files == {} and out.errors == []

@@ -7,7 +7,7 @@ def test_block_keyword_missing_colon():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="pack",
+            local_path="data/pack/blocklight/main.bl",
             source="""\
 function hello:
     if @s
@@ -26,7 +26,7 @@ def test_block_has_no_body():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="pack",
+            local_path="data/pack/blocklight/main.bl",
             source="""\
 function hello:
     if @s:
@@ -45,7 +45,7 @@ def test_condition_block_not_yet_implemented():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="pack",
+            local_path="data/pack/blocklight/main.bl",
             source="""\
 function hello:
     if @s:
@@ -64,7 +64,7 @@ def test_modifier_block_not_yet_implemented():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="pack",
+            local_path="data/pack/blocklight/main.bl",
             source="""\
 function hello:
     at @s:
@@ -83,7 +83,7 @@ def test_plain_statement_may_not_open_an_indented_block():
     out = blocklight.CompiledOutput()
     blocklight.compile_file(
         blocklight.SourceFile(
-            local_path="pack",
+            local_path="data/pack/blocklight/main.bl",
             source="""\
 function hello:
     say a
