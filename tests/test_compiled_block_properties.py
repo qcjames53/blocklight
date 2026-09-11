@@ -1,13 +1,15 @@
 # Vanilla macro handling and CompiledBlockProperties reporting
+# pyright: reportPrivateUsage=false
 
 import blocklight
+from tests.helpers import NO_HEADER, compile_source
 
 
 def _props(source: str) -> blocklight._BlockOutput:
     # Compile the body of the first (only) function and return its accumulated output.
     sf = blocklight.SourceFile(local_path="data/pack/blocklight/main.bl", source=source)
     block_out = blocklight._BlockOutput()
-    blocklight._compile_lines(blocklight._BlockInput(sf, "f"), block_out, sf.source_lines[1:], 1)
+    blocklight._compile_lines(blocklight._BlockInput(sf, "f", NO_HEADER), block_out, sf.source_lines[1:], 1)
     return block_out
 
 
@@ -29,49 +31,28 @@ def test_iter_macro_names_allows_full_charset():
 
 
 def test_macro_line_gets_dollar_prefix():
-    out = blocklight.CompiledOutput()
-    blocklight.compile_file(
-        blocklight.SourceFile(
-            local_path="data/pack/blocklight/main.bl",
-            source="""\
+    out = compile_source("""\
 function hello:
     say hi $(name)
-""",
-        ),
-        out,
-    )
+""")
     assert out.errors == []
     assert out.files == {"data/pack/function/main/hello.mcfunction": "$say hi $(name)"}
 
 
 def test_macro_line_existing_dollar_prefix():
-    out = blocklight.CompiledOutput()
-    blocklight.compile_file(
-        blocklight.SourceFile(
-            local_path="data/pack/blocklight/main.bl",
-            source="""\
+    out = compile_source("""\
 function hello:
     $say hi $(name)
-""",
-        ),
-        out,
-    )
+""")
     assert out.errors == []
     assert out.files == {"data/pack/function/main/hello.mcfunction": "$say hi $(name)"}
 
 
 def test_plain_line_is_untouched():
-    out = blocklight.CompiledOutput()
-    blocklight.compile_file(
-        blocklight.SourceFile(
-            local_path="data/pack/blocklight/main.bl",
-            source="""\
+    out = compile_source("""\
 function hello:
     say hello
-""",
-        ),
-        out,
-    )
+""")
     assert out.errors == []
     assert out.files == {"data/pack/function/main/hello.mcfunction": "say hello"}
 
@@ -94,18 +75,11 @@ function hello:
 
 
 def test_dollar_prefix_without_macro_is_an_error():
-    out = blocklight.CompiledOutput()
-    blocklight.compile_file(
-        blocklight.SourceFile(
-            local_path="data/pack/blocklight/main.bl",
-            source="""\
+    out = compile_source("""\
 function hello:
     say ok
     $say no macro here
-""",
-        ),
-        out,
-    )
+""")
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 3
@@ -113,18 +87,11 @@ function hello:
 
 
 def test_unclosed_macro_is_an_error_at_its_source_line():
-    out = blocklight.CompiledOutput()
-    blocklight.compile_file(
-        blocklight.SourceFile(
-            local_path="data/pack/blocklight/main.bl",
-            source="""\
+    out = compile_source("""\
 function hello:
     say ok
     say $(unclosed
-""",
-        ),
-        out,
-    )
+""")
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 3
@@ -132,17 +99,10 @@ function hello:
 
 
 def test_empty_macro_is_an_error():
-    out = blocklight.CompiledOutput()
-    blocklight.compile_file(
-        blocklight.SourceFile(
-            local_path="data/pack/blocklight/main.bl",
-            source="""\
+    out = compile_source("""\
 function hello:
     say $()
-""",
-        ),
-        out,
-    )
+""")
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.files == {}
@@ -150,13 +110,7 @@ function hello:
 
 def test_macro_name_rejects_invalid_characters():
     for bad in ("a b", "a-b", "a.b"):
-        out = blocklight.CompiledOutput()
-        blocklight.compile_file(
-            blocklight.SourceFile(
-                local_path="data/pack/blocklight/main.bl", source=f"function hello:\n    say $({bad})\n"
-            ),
-            out,
-        )
+        out = compile_source(f"function hello:\n    say $({bad})\n")
         assert len(out.errors) == 1
         assert isinstance(out.errors[0], blocklight.BLSyntaxError)
         assert out.errors[0].lineno == 2

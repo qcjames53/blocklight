@@ -1,6 +1,8 @@
 # Parsing helper validation
+# pyright: reportPrivateUsage=false
 
 import blocklight
+from tests.helpers import compile_source
 
 
 def test_split_lines():
@@ -33,6 +35,5 @@ function c:
 def test_span_iterator_no_functions():
     ctx = blocklight.SourceFile(local_path="data/foo/blocklight/main.bl", source="")
     assert list(blocklight._iter_spans(ctx.source_lines, ctx.single_indent, 0)) == []
-    out = blocklight.CompiledOutput()
-    blocklight.compile_file(blocklight.SourceFile(local_path="data/blank/blocklight/main.bl", source=""), out)
+    out = compile_source("", local_path="data/blank/blocklight/main.bl")
     assert out.files == {} and out.errors == []
