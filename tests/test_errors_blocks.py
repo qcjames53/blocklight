@@ -13,7 +13,7 @@ function hello:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 2
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_block_has_no_body():
@@ -25,7 +25,7 @@ function hello:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 2
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_condition_block_not_yet_implemented():
@@ -37,7 +37,7 @@ function hello:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 2
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_modifier_block_not_yet_implemented():
@@ -49,7 +49,7 @@ function hello:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 2
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_plain_statement_may_not_open_an_indented_block():
@@ -61,4 +61,4 @@ function hello:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 3
-    assert out.files == {}
+    assert out.file_contents == {}

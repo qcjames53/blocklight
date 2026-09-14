@@ -2,10 +2,10 @@
 # pyright: reportPrivateUsage=false
 
 import blocklight
-from tests.helpers import NO_HEADER, compile_source
+from tests.helpers import NO_HEADER, Result, compile_source
 
 
-def _compile(source: str, *, options: blocklight.CompilerOptions = NO_HEADER) -> blocklight.CompiledOutput:
+def _compile(source: str, *, options: blocklight.CompilerOptions = NO_HEADER) -> Result:
     return compile_source(
         source,
         local_path="data/bl_example/blocklight/python.bl",
@@ -24,7 +24,7 @@ function hardcode_example:
             emit("say hi")
 """)
     assert out.errors == []
-    assert out.files == {
+    assert out.file_contents == {
         "data/bl_example/function/python/hardcode_example.mcfunction": "say hi\nsay hi\nsay hi",
     }
 
@@ -38,7 +38,7 @@ function grid:
             emit(f"setblock {x} ~ ~ stone")
 """)
     assert out.errors == []
-    assert out.files == {
+    assert out.file_contents == {
         "data/bl_example/function/python/grid.mcfunction": (
             "setblock ~ ~ ~ stone\nsetblock ~1 ~ ~ stone\nsetblock ~2 ~ ~ stone"
         ),
@@ -54,7 +54,7 @@ function mixed:
     say after
 """)
     assert out.errors == []
-    assert out.files == {
+    assert out.file_contents == {
         "data/bl_example/function/python/mixed.mcfunction": "say before\nsay from python\nsay after",
     }
 
@@ -68,7 +68,7 @@ function empty:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 2
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_python_block_emits_all_bl_constants():
@@ -95,7 +95,7 @@ function locators_example:
             f"say Blocklight version: '{blocklight._BL_VERSION}'",
         ]
     )
-    assert out.files == {"data/bl_example/function/python/locators_example.mcfunction": expected}
+    assert out.file_contents == {"data/bl_example/function/python/locators_example.mcfunction": expected}
 
 
 def test_python_block_emitted_commands_get_macro_handling():
@@ -105,7 +105,7 @@ function macro_emit:
         emit("say hi $(name)")
 """)
     assert out.errors == []
-    assert out.files == {"data/bl_example/function/python/macro_emit.mcfunction": "$say hi $(name)"}
+    assert out.file_contents == {"data/bl_example/function/python/macro_emit.mcfunction": "$say hi $(name)"}
 
 
 def test_invalid_python_is_reported_as_bl_python_error():
@@ -117,7 +117,7 @@ function broken:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLPythonError)
     assert out.errors[0].lineno == 2  # points at the python: header
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_python_runtime_error_is_reported_and_isolated():
@@ -131,7 +131,7 @@ function fine:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLPythonError)
     # the well-formed function still compiles
-    assert out.files == {"data/bl_example/function/python/fine.mcfunction": "say ok"}
+    assert out.file_contents == {"data/bl_example/function/python/fine.mcfunction": "say ok"}
 
 
 def test_python_block_that_emits_nothing_produces_an_empty_function():
@@ -141,7 +141,7 @@ function silent:
         x = 1
 """)
     assert out.errors == []
-    assert out.files == {"data/bl_example/function/python/silent.mcfunction": ""}
+    assert out.file_contents == {"data/bl_example/function/python/silent.mcfunction": ""}
 
 
 def test_emitted_output_is_recompiled_as_blocklight_source():
@@ -158,7 +158,7 @@ function foo:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert "'as' block is not yet implemented" in str(out.errors[0])
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_no_python_option_rejects_python_blocks():
@@ -176,4 +176,4 @@ function plain:
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 2  # points at the python: header
     assert "--no-python" in str(out.errors[0])
-    assert out.files == {"data/bl_example/function/python/plain.mcfunction": "say ok"}
+    assert out.file_contents == {"data/bl_example/function/python/plain.mcfunction": "say ok"}

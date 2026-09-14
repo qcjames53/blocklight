@@ -1,0 +1,3 @@
+BLSyntaxError: The 'if' block is not yet implemented. (binary_search.bl, line 4)
+BLSyntaxError: The 'while' block is not yet implemented. (fizzbuzz.bl, line 5)
+BLSyntaxError: The 'as' block is not yet implemented. (macros.bl, line 3)

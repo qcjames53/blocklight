@@ -11,7 +11,7 @@ say hello
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 1
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_header_declares_function_twice():
@@ -22,7 +22,7 @@ function function foo:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 1
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_unknown_header_keyword():
@@ -33,7 +33,7 @@ foo function hello:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 1
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_duplicate_header_keyword():
@@ -44,7 +44,7 @@ load load function hello:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 1
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_header_missing_colon():
@@ -55,7 +55,7 @@ function hello
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 1
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_header_missing_function_name():
@@ -66,7 +66,7 @@ function :
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 1
-    assert out.files == {}
+    assert out.file_contents == {}
 
 
 def test_function_name_has_illegal_characters():
@@ -77,4 +77,4 @@ function hello@all:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 1
-    assert out.files == {}
+    assert out.file_contents == {}
