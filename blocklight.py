@@ -4,15 +4,16 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import string
 import sys
 import textwrap
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import InitVar, dataclass, field
-from functools import cached_property
-from typing import NamedTuple, cast
+from dataclasses import dataclass, field
+from typing import NamedTuple, TextIO, cast
 
 _BL_VERSION = "1.0.dev"
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
@@ -30,21 +31,22 @@ _MANIFEST_FILENAME = ".blocklight-manifest.json"
 _HEADER_MARKER = "Compiled by Blocklight"
 
 
+# One line in source tracking original line number
 class _Line(NamedTuple):
     text: str
     lineno: int
 
 
-class _ManifestEntry(NamedTuple):
-    source_hash: str | None
-    source_size: int | None
+# One source file's properties stored in the manifest
+class _ManifestSourceEntry(NamedTuple):
+    source_hash: str | None  # None only ever appears when reading an older, pre-hash manifest
     outputs: frozenset[str]
     needs_recompile: bool
 
 
 # Manifest file tracking facets of the previous compile
 class _Manifest(NamedTuple):
-    sources: dict[str, _ManifestEntry]
+    sources: dict[str, _ManifestSourceEntry]
     load: frozenset[str]
     tick: frozenset[str]
 
@@ -77,57 +79,13 @@ class BLFileError(BLNonFatalError):  # Raised on failures during file operations
     pass
 
 
-# Source contents and metadata surrounding an input file.
+# Source contents and metadata surrounding an input file. The caller has always already read and
+# cleaned the lines by the time this gets built (see Compile._read_source), so it just takes them.
 @dataclass
 class SourceFile:
     local_path: str
-    source: InitVar[str]
-    # Optional datapack metadata; surfaced to `python:` blocks as constants:
-    pack_name: str | None = None
-    pack_format: int | None = None
-    namespace: str | None = None
-    # Set at construction:
-    source_lines: list[_Line] = field(init=False)
-
-    def __post_init__(self, source: str) -> None:
-        self.source_lines = self._split_lines(source)
-
-    # Split lines, maintaining vanilla '\' behavior.
-    # Returns cleaned list of _Line(text, source line number).
-    @staticmethod
-    def _split_lines(source: str) -> list[_Line]:
-        output: list[_Line] = []
-        for line_number, line in enumerate(source.split("\n"), start=1):
-            line = line.rstrip()
-            lstrip_line = line.lstrip()
-
-            # Strip comment and whitespace lines
-            if lstrip_line.startswith("#") or len(lstrip_line) == 0:
-                continue
-
-            if output and output[-1].text.endswith("\\"):
-                prev = output[-1]
-                output[-1] = _Line(prev.text[:-1] + lstrip_line, prev.lineno)
-            else:
-                output.append(_Line(line, line_number))
-        return output
-
-    # String of spaces/tabs representing 1x indent, or "  " if the file has no indented lines.
-    # Computed on first read and cached.
-    @cached_property
-    def single_indent(self) -> str:
-        for line in self.source_lines:
-            indent = line.text[: len(line.text) - len(line.text.lstrip())]
-            if not indent:
-                continue
-            if " " in indent and "\t" in indent:
-                raise BLFatalError(
-                    "This file's detected indentation schema mixes tabs and spaces, which is not permitted.", line
-                )
-            if indent == " ":
-                raise BLFatalError("This file's indentation schema must be at least two spaces per indent.", line)
-            return indent
-        return "  "
+    source_lines: list[_Line]
+    namespace: str | None = None  # optional; surfaced to `python:` blocks as bl.NAMESPACE
 
 
 # Compile-time options, owned and parsed by TUI.
@@ -162,19 +120,33 @@ class _PythonBlockContext:
         self.PATH = sf.local_path
         self.FILE = sf.local_path.rsplit("/", 1)[-1]
         self.NAMESPACE = sf.namespace
-        self.PACK_NAME = sf.pack_name
-        self.PACK_FORMAT = sf.pack_format
+        self.PACK_NAME = orchestration.get_pack_name()
+        self.PACK_FORMAT = orchestration.get_pack_format()
         self.FUNCTION = block_in.function_name
         self.BLOCKLIGHT_VERSION = _BL_VERSION
 
 
 # Parses CLI args and is the sole recipient of every BLError raised anywhere in the compiler.
-# Also carries the `tick_*` hooks that will drive a future progress UI; for now they're no-ops.
+# Also owns the live progress footer: a spinner line pinned to the bottom of the terminal, driven
+# by the three tick_* counters and redrawn on its own thread, independent of tick arrival rate.
 class TUI:
+    _SPINNER_FRAMES = "|/-\\"
+    _REDRAW_INTERVAL = 1 / 15
+
     def __init__(self) -> None:
         self._options = CompilerOptions()
         self._errors: list[BLError] = []
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # guards _errors and the three tick counters below
+        self._discovered = 0
+        self._processed = 0
+        self._written = 0
+        self._start_time = 0.0
+        self._render_lock = threading.Lock()  # serializes all stderr writes (footer draws + print)
+        self._footer_thread: threading.Thread | None = None
+        self._footer_stop = threading.Event()
+        self._footer_active = False
+        self._footer_len = 0  # length of the last-drawn footer, so redraws fully overwrite it
+        self._spinner_index = 0
 
     def set_options(self, options: CompilerOptions) -> None:
         self._options = options
@@ -231,37 +203,102 @@ class TUI:
     def get_dry_run(self) -> bool:
         return self._options.dry_run
 
-    # Called from any compile/write thread; thread-safe.
+    # Thread safe
     def log_error(self, error: BLError) -> None:
         with self._lock:
             self._errors.append(error)
+        self.print(f"{type(error).__name__}: {error}")
 
+    # Thread safe
     def get_errors(self) -> list[BLError]:
         with self._lock:
             return list(self._errors)
 
-    def tick_discover_source_file(self, local_path: str) -> None:
-        pass
+    # Thread safe
+    def tick_discovered(self) -> None:
+        with self._lock:
+            self._discovered += 1
 
-    def tick_read_source_file(self, local_path: str) -> None:
-        pass
+    # Thread safe
+    def tick_processed(self) -> None:
+        with self._lock:
+            self._processed += 1
 
-    def tick_discover_output_file(self, filepath: str) -> None:
-        pass
+    # Thread safe
+    def tick_written(self) -> None:
+        with self._lock:
+            self._written += 1
 
-    def tick_complete_output_file_compile(self, filepath: str) -> None:
-        pass
+    # Starts the compile clock and the live footer (if tty).
+    def start(self) -> None:
+        self._start_time = time.monotonic()
+        if not sys.stderr.isatty():
+            return
+        self._footer_active = True
+        self._footer_stop.clear()
+        self._footer_thread = threading.Thread(target=self._render_loop, daemon=True)
+        self._footer_thread.start()
 
-    def tick_write_output_file(self, filepath: str) -> None:
-        pass
+    def _render_loop(self) -> None:
+        while True:
+            with self._render_lock:
+                self._draw_footer()
+            if self._footer_stop.wait(self._REDRAW_INTERVAL):
+                return
 
-    # Prints every held error (fatal first) in whatever way TUI currently sees fit.
+    def _footer_text(self) -> str:
+        with self._lock:
+            discovered, processed, written = self._discovered, self._processed, self._written
+        spinner = self._SPINNER_FRAMES[self._spinner_index % len(self._SPINNER_FRAMES)]
+        self._spinner_index += 1
+        elapsed = time.monotonic() - self._start_time
+        left = f"{spinner} ({discovered} discovered, {processed} processed, {written} written)"
+        right = f"{elapsed:.3f}s "
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        gap = max(1, width - len(left) - len(right))
+        return f"{left}{' ' * gap}{right}"[:width]
+
+    # Caller must hold _render_lock.
+    def _draw_footer(self) -> None:
+        line = self._footer_text()
+        pad = max(0, self._footer_len - len(line))
+        sys.stderr.write("\r" + line + (" " * pad))
+        sys.stderr.flush()
+        self._footer_len = len(line)
+
+    # Prints a line of output, keeping the footer pinned to the bottom line.
+    def print(self, message: str) -> None:
+        with self._render_lock:
+            if self._footer_active:
+                sys.stderr.write("\r" + (" " * self._footer_len) + "\r")
+                sys.stderr.write(message + "\n")
+                self._draw_footer()
+            else:
+                sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+
+    # Stops the footer (if running) and prints the final summary
     def finish(self) -> None:
-        errors = self.get_errors()
-        fatal = [e for e in errors if isinstance(e, BLFatalError)]
-        other = [e for e in errors if not isinstance(e, BLFatalError)]
-        for error in fatal + other:
-            print(f"{type(error).__name__}: {error}", file=sys.stderr)
+        if self._footer_active:
+            self._footer_stop.set()
+            if self._footer_thread is not None:
+                self._footer_thread.join()
+            self._footer_active = False
+            with self._render_lock:
+                sys.stderr.write("\r" + (" " * self._footer_len) + "\r")
+                sys.stderr.flush()
+                self._footer_len = 0
+        elapsed = time.monotonic() - self._start_time
+        with self._lock:
+            written, discovered = self._written, self._discovered
+            had_errors = bool(self._errors)
+        summary = (
+            f"Compiled {orchestration.get_pack_name()} in {elapsed:.3f} seconds. "
+            f"[{written} / {discovered}] output"
+        )
+        if had_errors:
+            summary += " (see above for errors)"
+        self.print(summary)
 
 
 # Owns pack.mcmeta/manifest state, discovery, both thread pools, and every datapack-level
@@ -277,8 +314,7 @@ class Orchestration:
         self._files: set[str] = set()
         self._load_functions: set[str] = set()
         self._tick_functions: set[str] = set()
-        self._source_hashes: dict[str, str | None] = {}
-        self._source_sizes: dict[str, int] = {}
+        self._source_hashes: dict[str, str] = {}
         self._source_outputs: dict[str, set[str]] = {}
         self._needs_recompile: set[str] = set()
         self._write_executor = ThreadPoolExecutor(max_workers=_FILE_WRITE_WORKERS_COUNT)
@@ -301,13 +337,12 @@ class Orchestration:
 
     # The previous run's record for this source, if any. None means never compiled before (or
     # its manifest entry was dropped/corrupt) -- Compile treats that like any other cache miss.
-    def get_previous_entry(self, local_path: str) -> _ManifestEntry | None:
+    def get_previous_entry(self, local_path: str) -> _ManifestSourceEntry | None:
         return self._previous.sources.get(local_path)
 
     # --- bookkeeping, called by Compile ---
-    def record_source(self, local_path: str, content_hash: str | None, content_size: int) -> None:
+    def record_source(self, local_path: str, content_hash: str) -> None:
         self._source_hashes[local_path] = content_hash
-        self._source_sizes[local_path] = content_size
         self._source_outputs.setdefault(local_path, set())
 
     def mark_needs_recompile(self, local_path: str) -> None:
@@ -328,6 +363,10 @@ class Orchestration:
         for output in entry.outputs:
             self._files.add(output)
             self._source_outputs.setdefault(local_path, set()).add(output)
+            # These still exist and are still valid, just not recompiled -- the final summary's
+            # function count must include them, or an incremental run would drastically undercount.
+            tui.tick_discovered()
+            tui.tick_written()
             function_id = self._function_id(output)
             if function_id in self._previous.load:
                 self.add_load_function(output)
@@ -353,7 +392,7 @@ class Orchestration:
         if tui.get_dry_run():
             self._files.add(filepath)
             self._source_outputs.setdefault(local_path, set()).add(filepath)
-            tui.tick_write_output_file(filepath)
+            tui.tick_written()
             return
         self._write_executor.submit(self._persist_file, filepath, contents, function_def_line, local_path)
 
@@ -380,7 +419,7 @@ class Orchestration:
         # Mutated from many write-pool threads; relies on the GIL for these single-op updates.
         self._files.add(filepath)
         self._source_outputs.setdefault(local_path, set()).add(filepath)
-        tui.tick_write_output_file(filepath)
+        tui.tick_written()
 
     def wait_for_writes(self) -> None:
         self._write_executor.shutdown(wait=True)
@@ -457,7 +496,7 @@ class Orchestration:
             return empty
         raw_dict = cast(dict[str, object], raw)
 
-        sources: dict[str, _ManifestEntry] = {}
+        sources: dict[str, _ManifestSourceEntry] = {}
         sources_raw = raw_dict.get("sources")
         if isinstance(sources_raw, dict):
             for local_path, value in cast(dict[str, object], sources_raw).items():
@@ -467,10 +506,8 @@ class Orchestration:
                 source_hash = entry.get("source_hash")
                 if source_hash is not None and not isinstance(source_hash, str):
                     continue
-                source_size = entry.get("source_size")
-                sources[local_path] = _ManifestEntry(
+                sources[local_path] = _ManifestSourceEntry(
                     source_hash=source_hash,
-                    source_size=source_size if isinstance(source_size, int) else None,
                     outputs=self._str_set(entry.get("outputs")),
                     needs_recompile=bool(entry.get("needs_recompile")),
                 )
@@ -479,7 +516,7 @@ class Orchestration:
         )
 
     # Persist this run's manifest: pack-wide load/tick function ids, plus each compiled source's
-    # content hash and size, its outputs, and whether it must always be recompiled next run.
+    # content hash, its outputs, and whether it must always be recompiled next run.
     def _write_manifest(self) -> None:
         manifest = {
             "load": sorted(self._function_id(output) for output in self._load_functions),
@@ -487,7 +524,6 @@ class Orchestration:
             "sources": {
                 local_path: {
                     "source_hash": content_hash,
-                    "source_size": self._source_sizes[local_path],
                     "outputs": sorted(self._source_outputs.get(local_path, set())),
                     "needs_recompile": local_path in self._needs_recompile,
                 }
@@ -596,15 +632,12 @@ class Compile:
         self.local_path = local_path
         self.namespace = namespace
 
-    # Reads the source file, compares its size (and, unless that alone proves a change, its hash
-    # and needs_recompile flag) against the previous manifest, and either reuses the previous
-    # outputs or deletes them and recompiles.
+    # Opens and reads the source file, determines if compile is needed, then deletes old output and recompiles
     def run(self) -> None:
-        tui.tick_discover_source_file(self.local_path)
+        tui.tick_discovered()
         try:
             with open(self.local_path, encoding="utf-8") as f:
-                source = f.read()
-                content_size = os.fstat(f.fileno()).st_size
+                source_lines, content_hash = self._read_source(f)
         except (OSError, UnicodeDecodeError) as err:
             # No entry gets recorded below, so this source is simply absent from the next
             # manifest and gets a fresh attempt next run regardless of mark_needs_recompile.
@@ -613,52 +646,86 @@ class Compile:
             error.filename = self.local_path
             tui.log_error(error)
             return
-        tui.tick_read_source_file(self.local_path)
+        tui.tick_processed()
 
         previous_entry = orchestration.get_previous_entry(self.local_path)
-        # A recorded size that doesn't match already proves the content changed; skip hashing
-        # entirely in that case. A missing size (e.g. from an older manifest) just falls back to
-        # always hashing, same as before size tracking existed.
-        size_definitely_changed = (
-            previous_entry is not None
-            and previous_entry.source_size is not None
-            and previous_entry.source_size != content_size
-        )
-        content_hash = None if size_definitely_changed else hashlib.sha256(source.encode("utf-8")).hexdigest()
-        orchestration.record_source(self.local_path, content_hash, content_size)
+        orchestration.record_source(self.local_path, content_hash)
 
         if (
             previous_entry is not None
-            and not size_definitely_changed
             and content_hash == previous_entry.source_hash
             and not previous_entry.needs_recompile
         ):
             orchestration.reuse_previous_outputs(self.local_path)
+            tui.tick_written()
             return
 
         if previous_entry is not None and not tui.get_dry_run():
             for output in previous_entry.outputs:
                 orchestration.delete_stale_output(output, self.local_path)
 
-        sf = SourceFile(
-            local_path=self.local_path,
-            source=source,
-            pack_name=orchestration.get_pack_name(),
-            pack_format=orchestration.get_pack_format(),
-            namespace=self.namespace,
-        )
+        sf = SourceFile(local_path=self.local_path, source_lines=source_lines, namespace=self.namespace)
         self.compile(sf)
+        tui.tick_written()
+
+    # One pass: cleans lines and incrementally hashes each kept line's final text.
+    @staticmethod
+    def _read_source(f: TextIO) -> tuple[list[_Line], str]:
+        hasher = hashlib.sha256()
+        lines: list[_Line] = []
+        for line in Compile._iter_clean_lines(enumerate(f, start=1)):
+            hasher.update(line.text.encode("utf-8"))
+            hasher.update(b"\n")
+            lines.append(line)
+        return lines, hasher.hexdigest()
+
+    # Cleans lines from any (line number, raw text) source. A continued line is only yielded
+    # once a non-continuing line ends it.
+    @staticmethod
+    def _iter_clean_lines(numbered_lines: Iterable[tuple[int, str]]) -> Iterator[_Line]:
+        pending: _Line | None = None
+        for line_number, raw_line in numbered_lines:
+            line = raw_line.rstrip()
+            lstrip_line = line.lstrip()
+
+            # Strip comment and whitespace lines
+            if lstrip_line.startswith("#") or len(lstrip_line) == 0:
+                continue
+
+            if pending is not None and pending.text.endswith("\\"):
+                pending = _Line(pending.text[:-1] + lstrip_line, pending.lineno)
+            else:
+                if pending is not None:
+                    yield pending
+                pending = _Line(line, line_number)
+        if pending is not None:
+            yield pending
 
     # Compile every function in `sf`, isolating recoverable errors to the function that raised them.
     def compile(self, sf: SourceFile) -> None:
         try:
-            for function_lines in self._iter_spans(sf.source_lines, sf.single_indent, 0):
+            for function_lines in self._iter_spans(sf.source_lines, self._single_indent(sf), 0):
                 try:
                     self._compile_function(sf, function_lines)
                 except BLNonFatalError as err:
                     orchestration.report_error(sf.local_path, err)
         except BLFatalError as err:
             orchestration.report_error(sf.local_path, err)
+
+    @staticmethod
+    def _single_indent(sf: SourceFile) -> str:
+        for line in sf.source_lines:
+            indent = line.text[: len(line.text) - len(line.text.lstrip())]
+            if not indent:
+                continue
+            if " " in indent and "\t" in indent:
+                raise BLFatalError(
+                    "This file's detected indentation schema mixes tabs and spaces, which is not permitted.", line
+                )
+            if indent == " ":
+                raise BLFatalError("This file's indentation schema must be at least two spaces per indent.", line)
+            return indent
+        return "  "
 
     # Yield lists of _Line objects for each command / block encountered at provided depth.
     @staticmethod
@@ -726,7 +793,7 @@ class Compile:
         else:
             nested_dir = "/".join([*subdirs, source_file.removesuffix(".bl")])
             output_filepath = f"{function_dir}/{nested_dir}/{function_name}.mcfunction"
-        tui.tick_discover_output_file(output_filepath)
+        tui.tick_discovered()
 
         block_out = _BlockOutput()
         if not tui.get_no_header():
@@ -737,7 +804,7 @@ class Compile:
             block_out.lines.append(f"#     `{sf.local_path}`")
         self._compile_lines(_BlockInput(sf, function_name), block_out, lines[1:], 1)
         orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
-        tui.tick_complete_output_file_compile(output_filepath)
+        tui.tick_processed()
 
         if "load" in seen_keywords:
             orchestration.add_load_function(output_filepath)
@@ -747,7 +814,7 @@ class Compile:
     # Compile the statements in `lines` at `depth`, appending commands and recording block
     # properties onto `block_out`.
     def _compile_lines(self, block_in: _BlockInput, block_out: _BlockOutput, lines: list[_Line], depth: int) -> None:
-        for span in self._iter_spans(lines, block_in.sf.single_indent, depth):
+        for span in self._iter_spans(lines, self._single_indent(block_in.sf), depth):
             line = span[0]
             text = line.text.lstrip()  # right is already stripped
             keyword = text.split(maxsplit=1)[0].removesuffix(":")  # 'python:' / 'else:' carry the colon; others don't
@@ -835,7 +902,7 @@ class Compile:
         except Exception as err:
             raise BLPythonError(f"this block raised {type(err).__name__}: {err}", head) from err
 
-        prefix = (sf.single_indent or "") * depth
+        prefix = Compile._single_indent(sf) * depth
         return [
             _Line(prefix + part, head.lineno)
             for command in emitted
@@ -850,7 +917,7 @@ def main() -> None:
         raise SystemExit(f"Blocklight {_BL_VERSION} requires Python {required} or newer.")
 
     tui.parse_args()
-    print("Compiling datapack...")
+    tui.start()
     orchestration.run()
     tui.finish()
 

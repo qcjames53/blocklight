@@ -1,7 +1,7 @@
 # Output mcfunction collision errors raised by CompiledOutput
 
 import blocklight
-from tests.helpers import compile_source, reset_for_test, stub_disk_writes
+from tests.helpers import build_lines, compile_source, reset_for_test, stub_disk_writes
 
 
 def test_duplicate_function_name_in_one_file():
@@ -36,10 +36,10 @@ def test_collision_between_two_files_sharing_a_root_output_path():
     compile_a = blocklight.Compile("data/pack/blocklight/a.bl", "pack")
     compile_b = blocklight.Compile("data/pack/blocklight/b.bl", "pack")
     src_a = blocklight.SourceFile(
-        local_path="data/pack/blocklight/a.bl", source="root function hello:\n    say from a\n"
+        local_path="data/pack/blocklight/a.bl", source_lines=build_lines("root function hello:\n    say from a\n")
     )
     src_b = blocklight.SourceFile(
-        local_path="data/pack/blocklight/b.bl", source="root function hello:\n    say from b\n"
+        local_path="data/pack/blocklight/b.bl", source_lines=build_lines("root function hello:\n    say from b\n")
     )
     with stub_disk_writes() as written:
         compile_a.compile(src_a)

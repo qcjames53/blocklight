@@ -14,3 +14,10 @@ function locators_example:
         emit(f"say Source file: '{bl.FILE}'")
         emit(f"say Function name: '{bl.FUNCTION}'")
         emit(f"say Blocklight version: '{bl.BLOCKLIGHT_VERSION}'")
+
+
+function slow_compile:
+    python:
+        for i in range(100000000):
+            pass
+        emit ("say done")

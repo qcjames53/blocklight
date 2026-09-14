@@ -38,7 +38,6 @@ def test_first_compile_writes_a_manifest():
     assert entry["outputs"] == [_OUTPUT]
     assert entry["needs_recompile"] is False
     assert isinstance(entry["source_hash"], str) and entry["source_hash"]
-    assert entry["source_size"] == len(b"function hello:\n    say hi\n")
 
 
 def test_manifest_records_load_and_tick_as_global_function_ids():
@@ -90,44 +89,20 @@ def test_changed_source_deletes_stale_output_and_recompiles():
     assert contents == "say bye"
 
 
-def test_size_change_skips_hashing_and_still_recompiles():
+def test_comment_only_change_does_not_trigger_recompile():
+    # The hash is computed from cleaned lines (comments/blanks already stripped, trailing
+    # whitespace rstripped), so a purely cosmetic edit must still cache-hit.
     with scratch_dir():
         _write_pack()
         _write_source("function hello:\n    say hi\n")
         run_compile(blocklight.CompilerOptions(no_header=True))
-        new_source = "function hello:\n    say hi there now\n"  # different length
-        _write_source(new_source)
-        run_compile(blocklight.CompilerOptions(no_header=True))
-        with open(_MANIFEST, encoding="utf-8") as f:
-            manifest = json.load(f)
-        contents = _read(_OUTPUT)
-    entry = manifest["sources"]["data/ns/blocklight/main.bl"]
-    assert contents == "say hi there now"
-    assert entry["source_hash"] is None  # size alone proved a change; hashing was skipped
-    assert entry["source_size"] == len(new_source.encode())
-
-
-def test_unchanged_size_after_a_skipped_hash_still_reaches_a_cache_hit():
-    # The run right after a size change has no hash to compare against (it was never computed),
-    # so it must recompile once more before caching resumes -- verify that backfill happens and
-    # the file isn't rewritten a third time.
-    with scratch_dir():
-        _write_pack()
-        _write_source("function hello:\n    say hi\n")
-        run_compile(blocklight.CompilerOptions(no_header=True))
-        _write_source("function hello:\n    say hi there now\n")
-        run_compile(blocklight.CompilerOptions(no_header=True))  # size changed: hash skipped
-        run_compile(blocklight.CompilerOptions(no_header=True))  # unchanged: backfills a hash
-        with open(_MANIFEST, encoding="utf-8") as f:
-            manifest = json.load(f)
         with open(_OUTPUT, "w", encoding="utf-8") as f:
             f.write("say tampered")
-        result = run_compile(blocklight.CompilerOptions(no_header=True))  # should now cache-hit
+        _write_source("# a new comment\nfunction hello:\n    say hi   \n\n")
+        result = run_compile(blocklight.CompilerOptions(no_header=True))
         contents = _read(_OUTPUT)
-    entry = manifest["sources"]["data/ns/blocklight/main.bl"]
-    assert isinstance(entry["source_hash"], str) and entry["source_hash"]
     assert result.errors == []
-    assert contents == "say tampered"  # untouched: cache-hit, not recompiled
+    assert contents == "say tampered"  # untouched: cleaned lines unchanged despite the cosmetic edit
 
 
 def test_renamed_function_orphans_the_old_output():

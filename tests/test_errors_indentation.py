@@ -1,4 +1,4 @@
-# Structural and indentation errors raised by SourceFile.single_indent and _iter_spans
+# Structural and indentation errors raised by Compile._single_indent and _iter_spans
 
 import blocklight
 from tests.helpers import compile_source

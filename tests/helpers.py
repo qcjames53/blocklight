@@ -22,6 +22,10 @@ class Result(NamedTuple):
     tick_functions: frozenset[str]
 
 
+def build_lines(source: str) -> list[blocklight._Line]:  # pyright: ignore[reportPrivateUsage]
+    return list(blocklight.Compile.iter_clean_lines(enumerate(source.split("\n"), start=1)))
+
+
 def _snapshot(file_contents: dict[str, str] | None = None) -> Result:
     return Result(
         errors=blocklight.tui.get_errors(),
@@ -81,14 +85,12 @@ def compile_source(
     namespace: str | None = None,
 ) -> Result:
     reset_for_test(options)
+    if pack_name is not None:
+        blocklight.orchestration._pack_name = pack_name  # pyright: ignore[reportPrivateUsage]
+    if pack_format is not None:
+        blocklight.orchestration._pack_format = pack_format  # pyright: ignore[reportPrivateUsage]
     compile_ = blocklight.Compile(local_path, local_path.split("/")[1])
-    sf = blocklight.SourceFile(
-        local_path=local_path,
-        source=source,
-        pack_name=pack_name,
-        pack_format=pack_format,
-        namespace=namespace,
-    )
+    sf = blocklight.SourceFile(local_path=local_path, source_lines=build_lines(source), namespace=namespace)
     with stub_disk_writes() as written:
         compile_.compile(sf)
         blocklight.orchestration.wait_for_writes()
