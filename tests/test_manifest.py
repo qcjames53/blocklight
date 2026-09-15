@@ -2,9 +2,10 @@
 
 import json
 import os
+import unittest.mock
 
 import blocklight
-from tests.helpers import run_compile, scratch_dir
+from tests.helpers import reset_for_test, run_compile, scratch_dir
 
 _MANIFEST = ".blocklight-manifest.json"
 _OUTPUT = "data/ns/function/main/hello.mcfunction"
@@ -129,6 +130,28 @@ def test_removed_source_orphans_its_outputs():
     assert not exists
 
 
+def test_dry_run_does_not_delete_the_stale_output_of_a_renamed_function():
+    with scratch_dir():
+        _write_pack()
+        _write_source("function hello:\n    say hi\n")
+        run_compile(blocklight.CompilerOptions(no_header=True))
+        _write_source("function goodbye:\n    say hi\n")
+        run_compile(blocklight.CompilerOptions(no_header=True, dry_run=True))
+        old_exists = os.path.exists(_OUTPUT)
+    assert old_exists  # a real run would delete this; a dry run must leave it alone
+
+
+def test_dry_run_does_not_delete_the_orphaned_output_of_a_removed_source():
+    with scratch_dir():
+        _write_pack()
+        _write_source("function hello:\n    say hi\n")
+        run_compile(blocklight.CompilerOptions(no_header=True))
+        os.remove("data/ns/blocklight/main.bl")
+        run_compile(blocklight.CompilerOptions(no_header=True, dry_run=True))
+        exists = os.path.exists(_OUTPUT)
+    assert exists  # a real run would orphan-delete this; a dry run must leave it alone
+
+
 def test_erroring_source_is_recompiled_every_run_even_if_unchanged():
     with scratch_dir():
         _write_pack()
@@ -179,6 +202,36 @@ def test_safe_mode_refuses_to_delete_output_missing_header():
         survived = _read(_OUTPUT)
     assert survived == "say not blocklight output"
     assert any(isinstance(e, blocklight.BLFileError) for e in result.errors)
+
+
+def test_delete_stale_output_reports_a_verify_read_failure():
+    with scratch_dir():
+        with open("stale.mcfunction", "w", encoding="utf-8") as f:
+            f.write(f"# {blocklight._HEADER_MARKER}\nsay hi\n")  # pyright: ignore[reportPrivateUsage]
+        reset_for_test(blocklight.CompilerOptions(verify_before_delete=True))
+        with unittest.mock.patch("blocklight.open", side_effect=OSError(13, "Permission denied")):
+            blocklight.orchestration.delete_stale_output("stale.mcfunction", "data/ns/blocklight/x.bl")
+        errors = blocklight.tui.get_errors()
+        survived = os.path.isfile("stale.mcfunction")
+    assert survived  # the verify read failed, so the file must never have reached os.remove
+    assert len(errors) == 1
+    assert isinstance(errors[0], blocklight.BLFileError)
+    assert "Failed to verify 'stale.mcfunction' before deleting" in str(errors[0])
+
+
+def test_delete_stale_output_reports_a_remove_failure():
+    with scratch_dir():
+        with open("stale.mcfunction", "w", encoding="utf-8") as f:
+            f.write("say hi\n")
+        reset_for_test()
+        with unittest.mock.patch("blocklight.os.remove", side_effect=OSError(13, "Permission denied")):
+            blocklight.orchestration.delete_stale_output("stale.mcfunction", "data/ns/blocklight/x.bl")
+        errors = blocklight.tui.get_errors()
+        survived = os.path.isfile("stale.mcfunction")
+    assert survived  # os.remove failed, so the real file must still be there
+    assert len(errors) == 1
+    assert isinstance(errors[0], blocklight.BLFileError)
+    assert "Failed to delete stale file 'stale.mcfunction'" in str(errors[0])
 
 
 def test_verify_before_delete_is_skipped_with_no_header():

@@ -1,8 +1,11 @@
 # End-to-end test: runs the actual blocklight CLI against the example datapack, compiling it in
-# place. Output is left on disk (see .gitignore); compilation isn't idempotent until
-# pre-deletion/manifest support lands. Three functions use not-yet-implemented block keywords and
-# are expected to fail and be reported on stderr.
+# place. Output is left on disk (see .gitignore) for inspection after a test run, but the test
+# deletes any such leftovers from a prior run before compiling, so it stays idempotent even though
+# manifest-driven caching would otherwise skip rewriting unchanged output (see test_manifest.py).
+# Three functions use not-yet-implemented block keywords and are expected to fail and be reported
+# on stderr.
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +14,8 @@ import blocklight
 
 _BLOCKLIGHT_SCRIPT = Path(__file__).resolve().parents[1] / "blocklight.py"
 _EXAMPLE_PACK = Path(__file__).resolve().parent / "example_pack"
+_GENERATED_FUNCTION_DIR = _EXAMPLE_PACK / "data" / "bl_example" / "function"
+_GENERATED_MANIFEST = _EXAMPLE_PACK / ".blocklight-manifest.json"
 
 _EXPECTED_FILE_CONTENTS = {
     "data/bl_example/function/hello_root.mcfunction": "say Hello, root!",
@@ -63,6 +68,9 @@ _EXPECTED_ERROR_FRAGMENTS = {
 
 
 def test_compiles_example_pack() -> None:
+    shutil.rmtree(_GENERATED_FUNCTION_DIR, ignore_errors=True)
+    _GENERATED_MANIFEST.unlink(missing_ok=True)
+
     result = subprocess.run(
         [sys.executable, str(_BLOCKLIGHT_SCRIPT), "--no-header"],
         cwd=_EXAMPLE_PACK,

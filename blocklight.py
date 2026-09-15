@@ -13,7 +13,7 @@ import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import NamedTuple, TextIO, cast
+from typing import NamedTuple, cast
 
 _BL_VERSION = "1.0.dev"
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
@@ -39,7 +39,7 @@ class _Line(NamedTuple):
 
 # One source file's properties stored in the manifest
 class _ManifestSourceEntry(NamedTuple):
-    source_hash: str | None  # None only ever appears when reading an older, pre-hash manifest
+    source_hash: str
     outputs: frozenset[str]
     needs_recompile: bool
 
@@ -236,15 +236,16 @@ class TUI:
             return
         self._footer_active = True
         self._footer_stop.clear()
-        self._footer_thread = threading.Thread(target=self._render_loop, daemon=True)
-        self._footer_thread.start()
 
-    def _render_loop(self) -> None:
-        while True:
-            with self._render_lock:
-                self._draw_footer()
-            if self._footer_stop.wait(self._REDRAW_INTERVAL):
-                return
+        def render_loop() -> None:
+            while True:
+                with self._render_lock:
+                    self._draw_footer()
+                if self._footer_stop.wait(self._REDRAW_INTERVAL):
+                    return
+
+        self._footer_thread = threading.Thread(target=render_loop, daemon=True)
+        self._footer_thread.start()
 
     def _footer_text(self) -> str:
         with self._lock:
@@ -293,8 +294,7 @@ class TUI:
             written, discovered = self._written, self._discovered
             had_errors = bool(self._errors)
         summary = (
-            f"Compiled {orchestration.get_pack_name()} in {elapsed:.3f} seconds. "
-            f"[{written} / {discovered}] output"
+            f"Compiled {orchestration.get_pack_name()} in {elapsed:.3f} seconds. [{written} / {discovered}] output"
         )
         if had_errors:
             summary += " (see above for errors)"
@@ -305,9 +305,6 @@ class TUI:
 # collection (compiled files, load/tick functions, source hashes/outputs, needs_recompile).
 class Orchestration:
     def __init__(self) -> None:
-        self._reset_state()
-
-    def _reset_state(self) -> None:
         self._pack_name: str = ""
         self._pack_format: int | None = None
         self._previous: _Manifest = _Manifest(sources={}, load=frozenset(), tick=frozenset())
@@ -319,7 +316,6 @@ class Orchestration:
         self._needs_recompile: set[str] = set()
         self._write_executor = ThreadPoolExecutor(max_workers=_FILE_WRITE_WORKERS_COUNT)
 
-    # --- pack-level getters ---
     def get_pack_name(self) -> str:
         return self._pack_name
 
@@ -340,7 +336,6 @@ class Orchestration:
     def get_previous_entry(self, local_path: str) -> _ManifestSourceEntry | None:
         return self._previous.sources.get(local_path)
 
-    # --- bookkeeping, called by Compile ---
     def record_source(self, local_path: str, content_hash: str) -> None:
         self._source_hashes[local_path] = content_hash
         self._source_outputs.setdefault(local_path, set())
@@ -363,9 +358,8 @@ class Orchestration:
         for output in entry.outputs:
             self._files.add(output)
             self._source_outputs.setdefault(local_path, set()).add(output)
-            # These still exist and are still valid, just not recompiled -- the final summary's
-            # function count must include them, or an incremental run would drastically undercount.
             tui.tick_discovered()
+            tui.tick_processed()
             tui.tick_written()
             function_id = self._function_id(output)
             if function_id in self._previous.load:
@@ -379,7 +373,7 @@ class Orchestration:
     def add_tick_function(self, function_output_filepath: str) -> None:
         self._tick_functions.add(function_output_filepath)
 
-    # Validates namespace containment, then writes (for real) or simulates (dry-run) the file.
+    # Validates namespace containment, then writes the file.
     def write_output_file(
         self, filepath: str, contents: str, function_def_line: _Line, local_path: str, namespace: str
     ) -> None:
@@ -396,18 +390,11 @@ class Orchestration:
             return
         self._write_executor.submit(self._persist_file, filepath, contents, function_def_line, local_path)
 
-    # Write one compiled file's bytes to disk.
-    @staticmethod
-    def _write_bytes_to_disk(filepath: str, contents: str) -> None:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "x", encoding="utf-8") as f:
-            f.write(contents)
-
     def _persist_file(self, filepath: str, contents: str, function_def_line: _Line, local_path: str) -> None:
         try:
-            # Called on the class, not `self`: a test patching this staticmethod with a plain
-            # function would otherwise have it bound as an instance method via `self.`.
-            Orchestration._write_bytes_to_disk(filepath, contents)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, "x", encoding="utf-8") as f:
+                f.write(contents)
         except FileExistsError:
             err = BLFileError(f"Another function already compiles to '{filepath}'.", function_def_line)
             self.report_error(local_path, err)
@@ -424,8 +411,8 @@ class Orchestration:
     def wait_for_writes(self) -> None:
         self._write_executor.shutdown(wait=True)
 
-    # Delete one stale output file. Under verify_before_delete (and unless no_header), refuses to
-    # delete anything missing the Blocklight header, since the manifest could be stale or wrong.
+    # Delete one stale output file.
+    # Does not delete anything missing the Blocklight header, since the manifest could be stale or wrong.
     def delete_stale_output(self, filepath: str, local_path: str) -> None:
         if not os.path.isfile(filepath):
             return
@@ -476,9 +463,7 @@ class Orchestration:
             return frozenset()
         return frozenset(item for item in cast(list[object], value) if isinstance(item, str))
 
-    # Convert a compiled output filepath ("data/<ns>/function/<rest>.mcfunction") to its function
-    # id ("<ns>:<rest>"), e.g. "data/bl_example/function/functions/hello_load.mcfunction" becomes
-    # "bl_example:functions/hello_load".
+    # Convert "data/<namespace>/function/<filepath_remainder>.mcfunction" to "<namespace>:<filepath_remainder>"
     @staticmethod
     def _function_id(filepath: str) -> str:
         _data, namespace, _function, *rest = filepath.split("/")
@@ -503,9 +488,7 @@ class Orchestration:
                 if not isinstance(value, dict):
                     continue
                 entry = cast(dict[str, object], value)
-                source_hash = entry.get("source_hash")
-                if source_hash is not None and not isinstance(source_hash, str):
-                    continue
+                source_hash = str(entry.get("source_hash"))  # str cast needed for typing
                 sources[local_path] = _ManifestSourceEntry(
                     source_hash=source_hash,
                     outputs=self._str_set(entry.get("outputs")),
@@ -515,8 +498,7 @@ class Orchestration:
             sources=sources, load=self._str_set(raw_dict.get("load")), tick=self._str_set(raw_dict.get("tick"))
         )
 
-    # Persist this run's manifest: pack-wide load/tick function ids, plus each compiled source's
-    # content hash, its outputs, and whether it must always be recompiled next run.
+    # Persist this run's manifest (info on this compile)
     def _write_manifest(self) -> None:
         manifest = {
             "load": sorted(self._function_id(output) for output in self._load_functions),
@@ -538,7 +520,6 @@ class Orchestration:
     def _iter_bl_files(self, blocklight_dir: str) -> Iterator[str]:
         no_symlink = tui.get_no_symlink()
         for root, dirs, files in os.walk(blocklight_dir, followlinks=not no_symlink):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
             if no_symlink:
                 kept_dirs: list[str] = []
                 for d in dirs:
@@ -552,7 +533,7 @@ class Orchestration:
                 dirs[:] = kept_dirs
             # A directory literally named "*.bl" is a candidate too; it fails naturally on open().
             for name in [*files, *(d for d in dirs if d.endswith(".bl"))]:
-                if name.startswith(".") or not name.endswith(".bl"):
+                if not name.endswith(".bl"):
                     continue
                 path = os.path.join(root, name)
                 if no_symlink and os.path.islink(path):
@@ -562,24 +543,17 @@ class Orchestration:
                     continue
                 yield path
 
-    # The one hard precondition for running blocklight at all: a pack.mcmeta in the current
-    # directory. Quits the whole program (not just this compile run) if it's missing or unparseable.
-    @staticmethod
-    def _load_pack_meta() -> dict[str, object]:
+    # Locate pack.mcmeta and every .bl file under data/<namespace>/blocklight/, compiling each
+    # concurrently, then write the manifest.
+    def run(self) -> None:
         if not os.path.isfile("pack.mcmeta"):
             raise SystemExit("No pack.mcmeta found in the current directory.")
         with open("pack.mcmeta", encoding="utf-8") as f:
             try:
-                return json.load(f)
+                pack_meta: dict[str, object] = json.load(f)
             except json.JSONDecodeError as err:
                 raise SystemExit(f"pack.mcmeta is not valid JSON: {err}") from err
 
-    # Locate pack.mcmeta and every .bl file under data/<namespace>/blocklight/, compiling each
-    # concurrently, then write the manifest.
-    def run(self) -> None:
-        self._reset_state()
-
-        pack_meta = self._load_pack_meta()
         self._pack_format = self._read_pack_format(pack_meta)
         self._pack_name = os.path.basename(os.getcwd())
         if set(self._pack_name) - _FUNCTION_NAME_CHARS:
@@ -637,7 +611,13 @@ class Compile:
         tui.tick_discovered()
         try:
             with open(self.local_path, encoding="utf-8") as f:
-                source_lines, content_hash = self._read_source(f)
+                hasher = hashlib.sha256()
+                source_lines: list[_Line] = []
+                for line in self._iter_clean_lines(enumerate(f, start=1)):
+                    hasher.update(line.text.encode("utf-8"))
+                    hasher.update(b"\n")
+                    source_lines.append(line)
+                content_hash = hasher.hexdigest()
         except (OSError, UnicodeDecodeError) as err:
             # No entry gets recorded below, so this source is simply absent from the next
             # manifest and gets a fresh attempt next run regardless of mark_needs_recompile.
@@ -668,17 +648,6 @@ class Compile:
         self.compile(sf)
         tui.tick_written()
 
-    # One pass: cleans lines and incrementally hashes each kept line's final text.
-    @staticmethod
-    def _read_source(f: TextIO) -> tuple[list[_Line], str]:
-        hasher = hashlib.sha256()
-        lines: list[_Line] = []
-        for line in Compile._iter_clean_lines(enumerate(f, start=1)):
-            hasher.update(line.text.encode("utf-8"))
-            hasher.update(b"\n")
-            lines.append(line)
-        return lines, hasher.hexdigest()
-
     # Cleans lines from any (line number, raw text) source. A continued line is only yielded
     # once a non-continuing line ends it.
     @staticmethod
@@ -699,6 +668,8 @@ class Compile:
                     yield pending
                 pending = _Line(line, line_number)
         if pending is not None:
+            if pending.text.endswith("\\"):
+                pending = _Line(pending.text[:-1], pending.lineno)
             yield pending
 
     # Compile every function in `sf`, isolating recoverable errors to the function that raised them.
@@ -844,27 +815,23 @@ class Compile:
 
             # Handle regular commands
             else:
-                self._append_command(block_out, line)
+                text = line.text.lstrip()  # right side already stripped
+                if not block_out.can_return:  # cheap early-return detection; occasional false positives are acceptable
+                    loc = text.find("return")
+                    word_start = loc == 0 or text[loc - 1] == " "
+                    word_end = len(text) <= loc + 6 or text[loc + 6] == " "
+                    if loc != -1 and word_start and word_end:
+                        block_out.can_return = True
 
-    # Record one command line's macros and early-return potential, then add it to the block's output.
-    @staticmethod
-    def _append_command(block_out: _BlockOutput, line: _Line) -> None:
-        text = line.text.lstrip()  # right side already stripped
-
-        if not block_out.can_return:  # cheap early-return detection; occasional false positives are acceptable
-            loc = text.find("return")
-            if loc != -1 and (loc == 0 or text[loc - 1] == " ") and (len(text) <= loc + 6 or text[loc + 6] == " "):
-                block_out.can_return = True
-
-        has_dollar = text.startswith("$")
-        uses_macro = False
-        if "$(" in text:
-            for macro_name in Compile._iter_macro_names(line):
-                block_out.macros.add(macro_name)
-                uses_macro = True
-        if not uses_macro and has_dollar:
-            raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
-        block_out.lines.append("$" + text if uses_macro and not has_dollar else text)
+                has_macro_dollar = text.startswith("$")
+                uses_macro = False
+                if "$(" in text:
+                    for macro_name in Compile._iter_macro_names(line):
+                        block_out.macros.add(macro_name)
+                        uses_macro = True
+                if not uses_macro and has_macro_dollar:
+                    raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
+                block_out.lines.append("$" + text if uses_macro and not has_macro_dollar else text)
 
     # Yield the name inside each vanilla macro '$(name)' in line, left to right.
     @staticmethod

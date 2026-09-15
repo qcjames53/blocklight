@@ -105,6 +105,16 @@ def test_invalid_namespace_is_skipped_but_others_still_compile():
     assert result.files == {"data/good_ns/function/main/hello.mcfunction"}
 
 
+def test_dry_run_does_not_write_output_files_to_disk():
+    with scratch_dir():
+        _write_pack({"pack": {"min_format": 1}})
+        _write_source("ns", "main.bl", "function hello:\n    say hi\n")
+        result = run_compile(_DRY_RUN)
+    # get_files() reflects what *would* be compiled, but nothing should actually touch disk.
+    assert result.files == {"data/ns/function/main/hello.mcfunction"}
+    assert not os.path.exists("data/ns/function/main/hello.mcfunction")
+
+
 def test_no_data_directory_produces_no_files_or_errors():
     with scratch_dir():
         _write_pack({"pack": {"min_format": 1}})

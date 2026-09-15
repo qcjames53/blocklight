@@ -23,7 +23,7 @@ class Result(NamedTuple):
 
 
 def build_lines(source: str) -> list[blocklight._Line]:  # pyright: ignore[reportPrivateUsage]
-    return list(blocklight.Compile.iter_clean_lines(enumerate(source.split("\n"), start=1)))
+    return list(blocklight.Compile._iter_clean_lines(enumerate(source.split("\n"), start=1)))  # pyright: ignore[reportPrivateUsage]
 
 
 def _snapshot(file_contents: dict[str, str] | None = None) -> Result:
@@ -49,19 +49,43 @@ def scratch_dir() -> Generator[None, None, None]:
             os.chdir(original_cwd)
 
 
+# A stand-in for the file object `open(path, "x")` returns, collecting what gets written into
+# `written` instead of touching the filesystem.
+class _FakeFile:
+    def __init__(self, filepath: str, written: dict[str, str]) -> None:
+        self._filepath = filepath
+        self._written = written
+
+    def __enter__(self) -> "_FakeFile":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def write(self, contents: str) -> None:
+        self._written[self._filepath] = self._written.get(self._filepath, "") + contents
+
+
 # Stubs the lowest-level disk write so a test can inspect compiled output without touching the
-# filesystem. Mimics `open(path, "x")`'s exclusive-create semantics (a repeat path raises
-# FileExistsError), so real collision-handling code in Orchestration still gets exercised.
+# filesystem. Patches `open` and `os.makedirs` as seen from inside blocklight.py (rather than
+# stubbing Orchestration._persist_file itself), so that method's real exclusive-create and
+# collision-handling logic still gets exercised. Mimics `open(path, "x")`'s exclusive-create
+# semantics (a repeat path raises FileExistsError).
 @contextlib.contextmanager
 def stub_disk_writes() -> Generator[dict[str, str], None, None]:
     written: dict[str, str] = {}
 
-    def fake_write(filepath: str, contents: str) -> None:
+    def fake_open(filepath: str, mode: str = "r", *args: object, **kwargs: object) -> _FakeFile:
+        assert mode == "x", f"stub_disk_writes only expects exclusive-create opens, got mode={mode!r}"
         if filepath in written:
             raise FileExistsError(f"'{filepath}' already exists")
-        written[filepath] = contents
+        written[filepath] = ""
+        return _FakeFile(filepath, written)
 
-    with unittest.mock.patch("blocklight.Orchestration._write_bytes_to_disk", fake_write):
+    with (
+        unittest.mock.patch("blocklight.os.makedirs"),
+        unittest.mock.patch("blocklight.open", fake_open, create=True),
+    ):
         yield written
 
 
