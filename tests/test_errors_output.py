@@ -1,7 +1,7 @@
 # Output mcfunction collision errors raised by CompiledOutput
 
 import blocklight
-from tests.helpers import NO_HEADER, compile_source
+from tests.helpers import build_lines, compile_source, reset_for_test, stub_disk_writes
 
 
 def test_duplicate_function_name_in_one_file():
@@ -12,10 +12,10 @@ function hello:
     say second
 """)
     assert len(out.errors) == 1
-    assert isinstance(out.errors[0], blocklight.BLSyntaxError)
+    assert isinstance(out.errors[0], blocklight.BLFileError)
     assert out.errors[0].lineno == 3
     # The first definition to compile wins; the collision is recoverable.
-    assert out.files == {"data/pack/function/main/hello.mcfunction": "say first"}
+    assert out.file_contents == {"data/pack/function/main/hello.mcfunction": "say first"}
 
 
 def test_duplicate_output_error_points_at_the_function_definition():
@@ -32,16 +32,21 @@ function hello:
 
 
 def test_collision_between_two_files_sharing_a_root_output_path():
-    out = blocklight.CompiledOutput()
+    reset_for_test()
+    compile_a = blocklight.Compile("data/pack/blocklight/a.bl", "pack")
+    compile_b = blocklight.Compile("data/pack/blocklight/b.bl", "pack")
     src_a = blocklight.SourceFile(
-        local_path="data/pack/blocklight/a.bl", source="root function hello:\n    say from a\n"
+        local_path="data/pack/blocklight/a.bl", source_lines=build_lines("root function hello:\n    say from a\n")
     )
     src_b = blocklight.SourceFile(
-        local_path="data/pack/blocklight/b.bl", source="root function hello:\n    say from b\n"
+        local_path="data/pack/blocklight/b.bl", source_lines=build_lines("root function hello:\n    say from b\n")
     )
-    blocklight.compile_file(src_a, out, NO_HEADER)
-    blocklight.compile_file(src_b, out, NO_HEADER)
-    assert len(out.errors) == 1
-    assert isinstance(out.errors[0], blocklight.BLSyntaxError)
-    assert out.errors[0].filename == "data/pack/blocklight/b.bl"
-    assert out.files == {"data/pack/function/hello.mcfunction": "say from a"}
+    with stub_disk_writes() as written:
+        compile_a.compile(src_a)
+        compile_b.compile(src_b)
+        blocklight.orchestration.wait_for_writes()
+    errors = blocklight.tui.get_errors()
+    assert len(errors) == 1
+    assert isinstance(errors[0], blocklight.BLFileError)
+    assert errors[0].filename == "data/pack/blocklight/b.bl"
+    assert written == {"data/pack/function/hello.mcfunction": "say from a"}
