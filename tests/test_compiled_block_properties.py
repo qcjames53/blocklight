@@ -11,7 +11,7 @@ def _props(source: str) -> blocklight._BlockOutput:
     sf = blocklight.SourceFile(local_path="data/pack/blocklight/main.bl", source_lines=build_lines(source))
     block_out = blocklight._BlockOutput()
     compile_ = blocklight.Compile("data/pack/blocklight/main.bl", "pack")
-    compile_._compile_lines(blocklight._BlockInput(sf, "f"), block_out, sf.source_lines[1:], 1)
+    compile_._compile_lines(blocklight._BlockInput(sf, "f", "pack:f"), block_out, sf.source_lines[1:], 1)
     return block_out
 
 

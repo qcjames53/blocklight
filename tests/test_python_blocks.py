@@ -80,7 +80,8 @@ function locators_example:
         emit(f"say Datapack format: '{bl.PACK_FORMAT}'")
         emit(f"say Namespace: '{bl.NAMESPACE}'")
         emit(f"say Source file: '{bl.FILE}'")
-        emit(f"say Function name: '{bl.FUNCTION}'")
+        emit(f"say Function name: '{bl.FUNCTION_NAME}'")
+        emit(f"say Output function name: '{bl.OUTPUT_FUNCTION_NAME}'")
         emit(f"say Blocklight version: '{bl.BLOCKLIGHT_VERSION}'")
 """)
     assert out.errors == []
@@ -92,6 +93,7 @@ function locators_example:
             "say Namespace: 'bl_example'",
             "say Source file: 'python.bl'",
             "say Function name: 'locators_example'",
+            "say Output function name: 'bl_example:python/locators_example'"
             f"say Blocklight version: '{blocklight._BL_VERSION}'",
         ]
     )

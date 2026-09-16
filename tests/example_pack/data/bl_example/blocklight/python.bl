@@ -12,12 +12,13 @@ function locators_example:
         emit(f"say Datapack format: '{bl.PACK_FORMAT}'")  # Major pack version only (e.g. 107), resolves to min_format if not provided explicitly
         emit(f"say Namespace: '{bl.NAMESPACE}'")
         emit(f"say Source file: '{bl.FILE}'")
-        emit(f"say Function name: '{bl.FUNCTION}'")
+        emit(f"say Top-level function name: '{bl.FUNCTION_NAME}'")
+        emit(f"say Minecraft function name containing this script's output: '{bl.OUTPUT_FUNCTION_NAME}'")
         emit(f"say Blocklight version: '{bl.BLOCKLIGHT_VERSION}'")
 
 
 function slow_compile:
     python:
-        for i in range(100000000):
+        for i in range(1000000):
             pass
         emit ("say done")

@@ -23,6 +23,31 @@ function hello:
     assert out.file_contents == {"data/hello_world/function/main/hello.mcfunction": "say Hello, world!"}
 
 
+def test_modifier_block_compiles_to_numbered_helper_function():
+    out = _compile("""\
+function hello:
+    at @s:
+        say hi
+    positioned ~ ~ ~:
+        say a
+    positioned ~ ~1 ~:
+        say b
+""")
+    assert out.errors == []
+    assert out.file_contents == {
+        "data/hello_world/function/main/hello.mcfunction": "\n".join(
+            [
+                "execute at @s run function hello_world:main/hello_helper/at_0",
+                "execute positioned ~ ~ ~ run function hello_world:main/hello_helper/positioned_0",
+                "execute positioned ~ ~1 ~ run function hello_world:main/hello_helper/positioned_1",
+            ]
+        ),
+        "data/hello_world/function/main/hello_helper/at_0.mcfunction": "say hi",
+        "data/hello_world/function/main/hello_helper/positioned_0.mcfunction": "say a",
+        "data/hello_world/function/main/hello_helper/positioned_1.mcfunction": "say b",
+    }
+
+
 def test_header_is_rendered_by_default():
     out = _compile(
         """\

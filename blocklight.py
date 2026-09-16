@@ -98,14 +98,15 @@ class CompilerOptions:
     dry_run: bool = False  # Compile in-memory only; do not write any files to disk
 
 
-# Read-only context threaded through the compilation of one function.
+# Read-only context threaded through the compilation of one block
 @dataclass
 class _BlockInput:
     sf: SourceFile
-    function_name: str
+    source_function_name: str  # Name of the top-level function from the function def
+    function_name: str  # Name of the output function this block will compile into
 
 
-# Mutable accumulator built up while compiling a function body.
+# Mutable accumulator built up while compiling one block.
 @dataclass
 class _BlockOutput:
     lines: list[str] = field(default_factory=list[str])  # compiled mcfunction command lines
@@ -122,13 +123,12 @@ class _PythonBlockContext:
         self.NAMESPACE = sf.namespace
         self.PACK_NAME = orchestration.get_pack_name()
         self.PACK_FORMAT = orchestration.get_pack_format()
-        self.FUNCTION = block_in.function_name
+        self.FUNCTION_NAME = block_in.source_function_name
+        self.OUTPUT_FUNCTION_NAME = block_in.function_name
         self.BLOCKLIGHT_VERSION = _BL_VERSION
 
 
-# Parses CLI args and is the sole recipient of every BLError raised anywhere in the compiler.
-# Also owns the live progress footer: a spinner line pinned to the bottom of the terminal, driven
-# by the three tick_* counters and redrawn on its own thread, independent of tick arrival rate.
+# Parses CLI args and drives user-facing progress UI
 class TUI:
     _SPINNER_FRAMES = "|/-\\"
     _REDRAW_INTERVAL = 1 / 15
@@ -720,6 +720,13 @@ class Compile:
         if span_start is not None:
             yield lines[span_start:]
 
+    # Convert a minecraft-consumable namespaced function name 
+    # "<namespace>:<path/without/extension>" -> "data/<namespace>/function/<path>.mcfunction".
+    @staticmethod
+    def _function_filepath(function_name: str) -> str:
+        namespace, path = function_name.split(":", 1)
+        return f"data/{namespace}/function/{path}.mcfunction"
+
     # Validate a function header and compile its body to an mcfunction file.
     def _compile_function(self, sf: SourceFile, lines: list[_Line]) -> None:
         header = lines[0]
@@ -758,12 +765,12 @@ class Compile:
             return
 
         _data, namespace, _src_root, *subdirs, source_file = sf.local_path.split("/")  # /data/<ns>/blocklight/*/f.bl
-        function_dir = f"data/{namespace}/function"
         if "root" in seen_keywords:
-            output_filepath = f"{function_dir}/{function_name}.mcfunction"
+            function_path = function_name
         else:
-            nested_dir = "/".join([*subdirs, source_file.removesuffix(".bl")])
-            output_filepath = f"{function_dir}/{nested_dir}/{function_name}.mcfunction"
+            function_path = "/".join([*subdirs, source_file.removesuffix(".bl"), function_name])
+        block_in = _BlockInput(sf, function_name, f"{namespace}:{function_path}")
+        output_filepath = self._function_filepath(block_in.function_name)
         tui.tick_discovered()
 
         block_out = _BlockOutput()
@@ -773,7 +780,7 @@ class Compile:
                 "# Changes saved to this file will not persist. Please modify the source file instead:"
             )
             block_out.lines.append(f"#     `{sf.local_path}`")
-        self._compile_lines(_BlockInput(sf, function_name), block_out, lines[1:], 1)
+        self._compile_lines(block_in, block_out, lines[1:], 1)
         orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
         tui.tick_processed()
 
@@ -782,56 +789,91 @@ class Compile:
         if "tick" in seen_keywords:
             orchestration.add_tick_function(output_filepath)
 
-    # Compile the statements in `lines` at `depth`, appending commands and recording block
-    # properties onto `block_out`.
+    # Compile the top-level commands in `lines` (at `depth`) + recursively compile child blocks
     def _compile_lines(self, block_in: _BlockInput, block_out: _BlockOutput, lines: list[_Line], depth: int) -> None:
+        counts: dict[str, int] = {}
         for span in self._iter_spans(lines, self._single_indent(block_in.sf), depth):
             line = span[0]
             text = line.text.lstrip()  # right is already stripped
             keyword = text.split(maxsplit=1)[0].removesuffix(":")  # 'python:' / 'else:' carry the colon; others don't
+            args = text.partition(" ")[2].removesuffix(":")
+            has_keyword = keyword in _BLOCK_KEYWORDS
             has_body = len(span) > 1
 
-            # Handle block defs
-            if keyword in _BLOCK_KEYWORDS:
+            # Handle block commands without body
+            if has_keyword and not has_body:
+                raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
+
+            # Handle block commands
+            elif has_keyword:
                 if not text.endswith(":"):
                     raise BLSyntaxError(f"'{keyword}' begins a block and must end with ':'.", line)
-                if not has_body:
-                    raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
-                if keyword == "python":
-                    if tui.get_no_python():
-                        raise BLSyntaxError(
-                            "This 'python:' block is not allowed because python blocks are disabled (--no-python).",
+
+                match keyword:
+                    case "python":
+                        if args != "":
+                            raise BLSyntaxError("'python:' blocks do not take arguments.", line)
+                        # Execute python (if permitted) and run emitted lines through this method recursively
+                        emitted = self._handle_python_block(block_in, span, depth)
+                        self._compile_lines(block_in, block_out, emitted, depth)
+
+                    case _ if keyword in _MODIFIER_BLOCK_KEYWORDS:
+                        if args == "":
+                            raise BLSyntaxError(f"'{keyword}' blocks require arguments.")
+                        # Recursively compile this block into <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
+                        tui.tick_discovered()
+                        keyword_count = counts.get(keyword, 0)
+                        counts[keyword] = keyword_count + 1
+                        child_function_name = f"{block_in.function_name}_helper/{keyword}_{keyword_count}"
+
+                        new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
+                        new_block_out = _BlockOutput()
+                        self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
+                        tui.tick_processed()
+
+                        orchestration.write_output_file(
+                            self._function_filepath(child_function_name),
+                            "\n".join(new_block_out.lines),
                             line,
+                            block_in.sf.local_path,
+                            child_function_name.split(":", 1)[0],
                         )
-                    if text != "python:":
-                        raise BLSyntaxError("A 'python:' block header takes no arguments.", line)
-                    orchestration.mark_needs_recompile(block_in.sf.local_path)  # non-deterministic: always recompile
-                    self._compile_lines(block_in, block_out, self._run_python_block(block_in, span, depth), depth)
-                else:
-                    # TODO create block handling here
-                    raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+
+                        # Call the recursive block from this function
+                        # TODO - respect returns and macros
+                        modifier_command = f"execute {keyword} {args} run function {child_function_name}"
+                        self._append_line_to_block_out(block_out, _Line(modifier_command, line.lineno))
+                    case _:
+                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+
+            # Handle regular commands with body
             elif has_body:
                 raise BLSyntaxError("Only block keywords may begin an indented block.", span[1])
 
             # Handle regular commands
             else:
-                text = line.text.lstrip()  # right side already stripped
-                if not block_out.can_return:  # cheap early-return detection; occasional false positives are acceptable
-                    loc = text.find("return")
-                    word_start = loc == 0 or text[loc - 1] == " "
-                    word_end = len(text) <= loc + 6 or text[loc + 6] == " "
-                    if loc != -1 and word_start and word_end:
-                        block_out.can_return = True
+                self._append_line_to_block_out(block_out, line)
 
-                has_macro_dollar = text.startswith("$")
-                uses_macro = False
-                if "$(" in text:
-                    for macro_name in Compile._iter_macro_names(line):
-                        block_out.macros.add(macro_name)
-                        uses_macro = True
-                if not uses_macro and has_macro_dollar:
-                    raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
-                block_out.lines.append("$" + text if uses_macro and not has_macro_dollar else text)
+    @staticmethod
+    def _append_line_to_block_out(block_out: _BlockOutput, line: _Line) -> None:
+        text = line.text.lstrip()
+        # Detect if maybe this line contains a return command. False positives are acceptable.
+        if not block_out.can_return:
+            return_string_location = text.find("return")
+            is_return_string_start_okay = return_string_location == 0 or text[return_string_location - 1] == " "
+            is_return_string_end_okay = len(text) <= return_string_location + 6 or text[return_string_location + 6] == " "
+            if return_string_location != -1 and is_return_string_start_okay and is_return_string_end_okay:
+                block_out.can_return = True
+        has_macro_dollar = text.startswith("$")
+        uses_macros = False
+        if "$(" in text:
+            for macro_name in Compile._iter_macro_names(line):
+                block_out.macros.add(macro_name)
+                uses_macros = True
+        if has_macro_dollar and not uses_macros:
+            raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
+        block_out.lines.append("$" + text if not has_macro_dollar and uses_macros else text)
+
 
     # Yield the name inside each vanilla macro '$(name)' in line, left to right.
     @staticmethod
@@ -851,11 +893,14 @@ class Compile:
 
     # Execute a python: block and return the lines it emits re-indented to `depth` and anchored at the block header.
     @staticmethod
-    def _run_python_block(block_in: _BlockInput, span: list[_Line], depth: int) -> list[_Line]:
+    def _handle_python_block(block_in: _BlockInput, span: list[_Line], depth: int) -> list[_Line]:
         sf = block_in.sf
         head = span[0]
         body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
 
+        if tui.get_no_python():
+            raise BLSyntaxError("This Python blocks is disabled due to your compile parameters.", head)
+        orchestration.mark_needs_recompile(sf.local_path)
         emitted: list[str] = []
 
         def emit(command: object) -> None:
@@ -876,6 +921,10 @@ class Compile:
             for part in str(command).split("\n")
             if part.strip()
         ]
+
+    @staticmethod
+    def _handle_modifier_block(block_in: _BlockInput, span: list[_Line], depth: int) -> list[_Line]:
+        pass
 
 
 def main() -> None:
