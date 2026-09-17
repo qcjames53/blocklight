@@ -59,7 +59,7 @@ function hello:
     assert out.errors == []
     expected = "\n".join(
         [
-            f"# Compiled by Blocklight {blocklight._BL_VERSION} (https://github.com/qcjames53/blocklight)",
+            f"# Compiled by Blocklight {blocklight._BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)",
             "# Changes saved to this file will not persist. Please modify the source file instead:",
             "#     `data/hello_world/blocklight/main.bl`",
             "say Hello, world!",

@@ -2,7 +2,7 @@
 # place. Output is left on disk (see .gitignore) for inspection after a test run, but the test
 # deletes any such leftovers from a prior run before compiling, so it stays idempotent even though
 # manifest-driven caching would otherwise skip rewriting unchanged output (see test_manifest.py).
-# Three functions use not-yet-implemented block keywords and are expected to fail and be reported
+# Two functions use not-yet-implemented block keywords and are expected to fail and be reported
 # on stderr.
 
 import shutil
@@ -39,6 +39,21 @@ _EXPECTED_FILE_CONTENTS = {
     "data/bl_example/function/macros/macros_demo_runner.mcfunction": (
         'function bl_example:macros/macros_demo_a with {"a": "hello"}'
     ),
+    "data/bl_example/function/macros/macros_demo_a.mcfunction": (
+        '$execute as @s run function bl_example:macros/macros_demo_a_helper/as_0 with {"a": "$(a)"}\n'
+        '$function bl_example:macros/macros_demo_b with {"a": "$(a)"}'
+    ),
+    "data/bl_example/function/macros/macros_demo_a_helper/as_0.mcfunction": (
+        '$execute at @s run function bl_example:macros/macros_demo_a_helper/as_0_helper/at_0 '
+        'with {"a": "$(a)"}'
+    ),
+    "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0.mcfunction": (
+        '$execute positioned ~ ~ ~ run function '
+        'bl_example:macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0 with {"a": "$(a)"}'
+    ),
+    "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0.mcfunction": (
+        "$say $(a) from macros_demo_a"
+    ),
     "data/bl_example/function/macros/macros_demo_b.mcfunction": "$say $(a) from macros_demo_b",
     "data/bl_example/function/python/hardcode_example.mcfunction": "\n".join(["say hi"] * 20),
     "data/bl_example/function/python/locators_example.mcfunction": (
@@ -47,23 +62,22 @@ _EXPECTED_FILE_CONTENTS = {
         "say Datapack format: '107'\n"
         "say Namespace: 'bl_example'\n"
         "say Source file: 'python.bl'\n"
-        "say Function name: 'locators_example'\n"
-        f"say Blocklight version: '{blocklight._BL_VERSION}'"  # pyright: ignore[reportPrivateUsage]
+        "say Top-level function name: 'locators_example'\n"
+        "say Minecraft function name containing this script's output: 'bl_example:python/locators_example'\n"
+        f"say Blocklight version: '{blocklight._BL_VERSION_STRING}'"  # pyright: ignore[reportPrivateUsage]
     ),
 }
 
-# Functions using not-yet-implemented block keywords (while/if/as) must not compile.
+# Functions using not-yet-implemented block keywords (while/if) must not compile.
 _EXPECTED_MISSING_FILES = {
     "data/bl_example/function/fizzbuzz/fizzbuzz.mcfunction",
     "data/bl_example/function/binary_search/ocean_floor_height.mcfunction",
-    "data/bl_example/function/macros/macros_demo_a.mcfunction",
 }
 
-# (source basename, line) for the three expected recoverable errors, as they appear on stderr.
+# (source basename, line) for the two expected recoverable errors, as they appear on stderr.
 _EXPECTED_ERROR_FRAGMENTS = {
     "(fizzbuzz.bl, line 5)",
     "(binary_search.bl, line 4)",
-    "(macros.bl, line 3)",
 }
 
 

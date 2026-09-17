@@ -66,7 +66,9 @@ def test_reused_source_still_registers_as_load_and_tick():
 
 
 def test_unchanged_source_is_skipped_not_rewritten():
-    with scratch_dir():
+    # The dev-build flag forces every source to recompile regardless of the cached hash, so it
+    # must be disabled here to exercise the skip path this test is actually about.
+    with scratch_dir(), unittest.mock.patch("blocklight._BL_IS_DEV_BUILD", False):
         _write_pack()
         _write_source("function hello:\n    say hi\n")
         run_compile(blocklight.CompilerOptions(no_header=True))
@@ -92,8 +94,9 @@ def test_changed_source_deletes_stale_output_and_recompiles():
 
 def test_comment_only_change_does_not_trigger_recompile():
     # The hash is computed from cleaned lines (comments/blanks already stripped, trailing
-    # whitespace rstripped), so a purely cosmetic edit must still cache-hit.
-    with scratch_dir():
+    # whitespace rstripped), so a purely cosmetic edit must still cache-hit. As above, the
+    # dev-build flag must be disabled or it would force a recompile regardless.
+    with scratch_dir(), unittest.mock.patch("blocklight._BL_IS_DEV_BUILD", False):
         _write_pack()
         _write_source("function hello:\n    say hi\n")
         run_compile(blocklight.CompilerOptions(no_header=True))
