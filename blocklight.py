@@ -15,7 +15,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import NamedTuple, cast
 
-_BL_VERSION = "1.0.dev"
+_BL_VERSION = (1, 0)
+_BL_IS_DEV_BUILD = True
+_BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
 
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
@@ -49,6 +51,7 @@ class _Manifest(NamedTuple):
     sources: dict[str, _ManifestSourceEntry]
     load: frozenset[str]
     tick: frozenset[str]
+    version: tuple[int, int]
 
 
 class BLError(SyntaxError):
@@ -96,6 +99,7 @@ class CompilerOptions:
     no_symlink: bool = False  # Refuse to follow symlinked directories or read symlinked source files
     verify_before_delete: bool = False  # Before deleting a stale output, confirm it has the Blocklight header
     dry_run: bool = False  # Compile in-memory only; do not write any files to disk
+    force: bool = False  # Recompile every source regardless of the cached hash
 
 
 # Read-only context threaded through the compilation of one block
@@ -125,7 +129,7 @@ class _PythonBlockContext:
         self.PACK_FORMAT = orchestration.get_pack_format()
         self.FUNCTION_NAME = block_in.source_function_name
         self.OUTPUT_FUNCTION_NAME = block_in.function_name
-        self.BLOCKLIGHT_VERSION = _BL_VERSION
+        self.BLOCKLIGHT_VERSION = _BL_VERSION_STRING
 
 
 # Parses CLI args and drives user-facing progress UI
@@ -153,7 +157,7 @@ class TUI:
 
     def parse_args(self, argv: list[str] | None = None) -> None:
         parser = argparse.ArgumentParser(prog="blocklight", description=__doc__)
-        parser.add_argument("--version", action="version", version=f"Blocklight {_BL_VERSION}")
+        parser.add_argument("--version", action="version", version=f"Blocklight {_BL_VERSION_STRING}")
         parser.add_argument(
             "--no-header",
             action="store_true",
@@ -177,7 +181,14 @@ class TUI:
             action="store_true",
             help="test compile without writing any files to disk",
         )
+        parser.add_argument(
+            "--force",
+            action="store_true",
+            help="ignore manifest hashing and force recompile of all files",
+        )
         args = parser.parse_args(argv)
+        # Dev builds and version bumps invalidate the cache themselves, same as an explicit --force.
+        force = args.force or _BL_IS_DEV_BUILD
         self.set_options(
             CompilerOptions(
                 no_header=args.no_header,
@@ -185,6 +196,7 @@ class TUI:
                 no_symlink=args.no_symlink or args.safe,
                 verify_before_delete=args.safe,
                 dry_run=args.dry_run,
+                force=force,
             )
         )
 
@@ -202,6 +214,9 @@ class TUI:
 
     def get_dry_run(self) -> bool:
         return self._options.dry_run
+
+    def get_force(self) -> bool:
+        return self._options.force
 
     # Thread safe
     def log_error(self, error: BLError) -> None:
@@ -307,7 +322,7 @@ class Orchestration:
     def __init__(self) -> None:
         self._pack_name: str = ""
         self._pack_format: int | None = None
-        self._previous: _Manifest = _Manifest(sources={}, load=frozenset(), tick=frozenset())
+        self._previous_manifest: _Manifest | None = None
         self._files: set[str] = set()
         self._load_functions: set[str] = set()
         self._tick_functions: set[str] = set()
@@ -333,8 +348,11 @@ class Orchestration:
 
     # The previous run's record for this source, if any. None means never compiled before (or
     # its manifest entry was dropped/corrupt) -- Compile treats that like any other cache miss.
-    def get_previous_entry(self, local_path: str) -> _ManifestSourceEntry | None:
-        return self._previous.sources.get(local_path)
+    def get_previous_manifest_entry(self, local_path: str) -> _ManifestSourceEntry | None:
+        return self._previous_manifest.sources.get(local_path) if self._previous_manifest else None
+
+    def get_previous_compiler_version(self) -> tuple[int, int] | None:
+        return self._previous_manifest.version if self._previous_manifest else None
 
     def record_source(self, local_path: str, content_hash: str) -> None:
         self._source_hashes[local_path] = content_hash
@@ -352,7 +370,9 @@ class Orchestration:
 
     # Cache-hit path: carries a hash-unchanged source's previous outputs forward.
     def reuse_previous_outputs(self, local_path: str) -> None:
-        entry = self._previous.sources.get(local_path)
+        if self._previous_manifest is None:
+            return
+        entry = self._previous_manifest.sources.get(local_path)
         if entry is None:
             return
         for output in entry.outputs:
@@ -362,9 +382,9 @@ class Orchestration:
             tui.tick_processed()
             tui.tick_written()
             function_id = self._function_id(output)
-            if function_id in self._previous.load:
+            if function_id in self._previous_manifest.load:
                 self.add_load_function(output)
-            if function_id in self._previous.tick:
+            if function_id in self._previous_manifest.tick:
                 self.add_tick_function(output)
 
     def add_load_function(self, function_output_filepath: str) -> None:
@@ -463,6 +483,14 @@ class Orchestration:
             return frozenset()
         return frozenset(item for item in cast(list[object], value) if isinstance(item, str))
 
+    @staticmethod
+    def _version_pair(value: object) -> tuple[int, int]:
+        if isinstance(value, list):
+            parts = cast(list[object], value)
+            if len(parts) == 2 and all(isinstance(part, int) for part in parts):
+                return (cast(int, parts[0]), cast(int, parts[1]))
+        return (0, 0)
+
     # Convert "data/<namespace>/function/<filepath_remainder>.mcfunction" to "<namespace>:<filepath_remainder>"
     @staticmethod
     def _function_id(filepath: str) -> str:
@@ -470,15 +498,14 @@ class Orchestration:
         return f"{namespace}:{'/'.join(rest).removesuffix('.mcfunction')}"
 
     # Load the previous run's manifest, if any. A missing or corrupt manifest is treated as empty.
-    def _read_manifest(self) -> _Manifest:
-        empty = _Manifest(sources={}, load=frozenset(), tick=frozenset())
+    def _read_manifest(self) -> _Manifest | None:
         try:
             with open(_MANIFEST_FILENAME, encoding="utf-8") as f:
                 raw: object = json.load(f)
         except (OSError, json.JSONDecodeError):
-            return empty
+            return None
         if not isinstance(raw, dict):
-            return empty
+            return None
         raw_dict = cast(dict[str, object], raw)
 
         sources: dict[str, _ManifestSourceEntry] = {}
@@ -495,12 +522,16 @@ class Orchestration:
                     needs_recompile=bool(entry.get("needs_recompile")),
                 )
         return _Manifest(
-            sources=sources, load=self._str_set(raw_dict.get("load")), tick=self._str_set(raw_dict.get("tick"))
+            sources=sources,
+            load=self._str_set(raw_dict.get("load")),
+            tick=self._str_set(raw_dict.get("tick")),
+            version=self._version_pair(raw_dict.get("version")),
         )
 
     # Persist this run's manifest (info on this compile)
     def _write_manifest(self) -> None:
         manifest = {
+            "version": list(_BL_VERSION),
             "load": sorted(self._function_id(output) for output in self._load_functions),
             "tick": sorted(self._function_id(output) for output in self._tick_functions),
             "sources": {
@@ -564,7 +595,7 @@ class Orchestration:
         if not os.path.isdir("data"):
             return
 
-        self._previous = self._read_manifest()
+        self._previous_manifest = self._read_manifest()
 
         discovered: dict[str, str] = {}  # local_path -> namespace
         for namespace in sorted(os.listdir("data")):
@@ -579,9 +610,10 @@ class Orchestration:
                 discovered[local_path] = namespace
 
         # Sources present in the last manifest but not found this run: their outputs are orphaned.
-        if not tui.get_dry_run():
-            for local_path in sorted(set(self._previous.sources) - set(discovered)):
-                for output in self._previous.sources[local_path].outputs:
+        previous_manifest = self._previous_manifest
+        if not tui.get_dry_run() and previous_manifest is not None:
+            for local_path in sorted(set(previous_manifest.sources) - set(discovered)):
+                for output in previous_manifest.sources[local_path].outputs:
                     self.delete_stale_output(output, local_path)
 
         with ThreadPoolExecutor() as executor:
@@ -628,13 +660,16 @@ class Compile:
             return
         tui.tick_processed()
 
-        previous_entry = orchestration.get_previous_entry(self.local_path)
+        previous_entry = orchestration.get_previous_manifest_entry(self.local_path)
         orchestration.record_source(self.local_path, content_hash)
+        previous_compiler_version = orchestration.get_previous_compiler_version()
 
+        # Skip recompile of already-compiled files under circumstances considered safe
         if (
-            previous_entry is not None
-            and content_hash == previous_entry.source_hash
-            and not previous_entry.needs_recompile
+            not _BL_IS_DEV_BUILD and
+            not tui.get_force() and
+            previous_compiler_version and previous_compiler_version == _BL_VERSION and
+            previous_entry is not None and previous_entry.source_hash == content_hash
         ):
             orchestration.reuse_previous_outputs(self.local_path)
             tui.tick_written()
@@ -720,7 +755,7 @@ class Compile:
         if span_start is not None:
             yield lines[span_start:]
 
-    # Convert a minecraft-consumable namespaced function name 
+    # Convert a minecraft-consumable namespaced function name
     # "<namespace>:<path/without/extension>" -> "data/<namespace>/function/<path>.mcfunction".
     @staticmethod
     def _function_filepath(function_name: str) -> str:
@@ -775,7 +810,9 @@ class Compile:
 
         block_out = _BlockOutput()
         if not tui.get_no_header():
-            block_out.lines.append(f"# {_HEADER_MARKER} {_BL_VERSION} (https://github.com/qcjames53/blocklight)")
+            block_out.lines.append(
+                f"# {_HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)"
+            )
             block_out.lines.append(
                 "# Changes saved to this file will not persist. Please modify the source file instead:"
             )
@@ -820,7 +857,8 @@ class Compile:
                     case _ if keyword in _MODIFIER_BLOCK_KEYWORDS:
                         if args == "":
                             raise BLSyntaxError(f"'{keyword}' blocks require arguments.")
-                        # Recursively compile this block into <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
+                        # Recursively compile this block into
+                        # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
                         tui.tick_discovered()
                         keyword_count = counts.get(keyword, 0)
                         counts[keyword] = keyword_count + 1
@@ -839,9 +877,15 @@ class Compile:
                             child_function_name.split(":", 1)[0],
                         )
 
+                        # Detemine what macros were used (if any)
+                        macros_string = ""
+                        if len(new_block_out.macros) >= 1:
+                            macro_args = ", ".join(f'"{m}": "$({m})"' for m in sorted(new_block_out.macros))
+                            macros_string = f" with {{{macro_args}}}"
+
                         # Call the recursive block from this function
                         # TODO - respect returns and macros
-                        modifier_command = f"execute {keyword} {args} run function {child_function_name}"
+                        modifier_command = f"execute {keyword} {args} run function {child_function_name}{macros_string}"
                         self._append_line_to_block_out(block_out, _Line(modifier_command, line.lineno))
                     case _:
                         raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
@@ -860,9 +904,11 @@ class Compile:
         # Detect if maybe this line contains a return command. False positives are acceptable.
         if not block_out.can_return:
             return_string_location = text.find("return")
-            is_return_string_start_okay = return_string_location == 0 or text[return_string_location - 1] == " "
-            is_return_string_end_okay = len(text) <= return_string_location + 6 or text[return_string_location + 6] == " "
-            if return_string_location != -1 and is_return_string_start_okay and is_return_string_end_okay:
+            if (
+                return_string_location != -1 and
+                (return_string_location == 0 or text[return_string_location - 1] == " ") and  # Start okay
+                (len(text) <= return_string_location + 6 or text[return_string_location + 6] == " ")  # End okay
+            ):
                 block_out.can_return = True
         has_macro_dollar = text.startswith("$")
         uses_macros = False
@@ -922,15 +968,11 @@ class Compile:
             if part.strip()
         ]
 
-    @staticmethod
-    def _handle_modifier_block(block_in: _BlockInput, span: list[_Line], depth: int) -> list[_Line]:
-        pass
-
 
 def main() -> None:
     if sys.version_info < _MIN_PYTHON:
         required = ".".join(str(part) for part in _MIN_PYTHON)
-        raise SystemExit(f"Blocklight {_BL_VERSION} requires Python {required} or newer.")
+        raise SystemExit(f"Blocklight {_BL_VERSION_STRING} requires Python {required} or newer.")
 
     tui.parse_args()
     tui.start()
@@ -938,8 +980,8 @@ def main() -> None:
     tui.finish()
 
 
-tui = TUI()
-orchestration = Orchestration()
+tui: TUI = TUI()
+orchestration: Orchestration = Orchestration()
 
 
 # Replaces both globals with fresh instances. Mainly for test isolation between compile runs.

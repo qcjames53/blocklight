@@ -15,10 +15,3 @@ function locators_example:
         emit(f"say Top-level function name: '{bl.FUNCTION_NAME}'")
         emit(f"say Minecraft function name containing this script's output: '{bl.OUTPUT_FUNCTION_NAME}'")
         emit(f"say Blocklight version: '{bl.BLOCKLIGHT_VERSION}'")
-
-
-function slow_compile:
-    python:
-        for i in range(1000000):
-            pass
-        emit ("say done")
