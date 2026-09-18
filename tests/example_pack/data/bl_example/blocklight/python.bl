@@ -1,12 +1,12 @@
-function hardcode_example:
-    python:
+function hardcode_example
+    python
         for i in range(20):
             emit("say hi")
 
 
-function locators_example:
-    # These are all available inside every `python:` block for free.
-    python:
+function locators_example
+    # These are all available inside every `python` block for free.
+    python
         emit(f"say Relative filepath: '{bl.PATH}'")
         emit(f"say Datapack name: '{bl.PACK_NAME}'")
         emit(f"say Datapack format: '{bl.PACK_FORMAT}'")  # Major pack version only (e.g. 107), resolves to min_format if not provided explicitly

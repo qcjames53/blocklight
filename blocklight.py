@@ -16,12 +16,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import NamedTuple, cast
 
-# Tweakable constants
+# ----- Tweakable constants ----- #
 _BL_VERSION = (1, 0)
 _BL_IS_DEV_BUILD = True
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
 _FILE_WRITE_WORKERS_COUNT = 8
 
+# ----- Compiler internal constants ----- #
 _BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
 _MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")
@@ -32,23 +33,42 @@ _MODIFIER_BLOCK_KEYWORDS = frozenset(
 _RECURSIVE_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "else", "while"))
 _INLINE_BLOCK_KEYWORDS = frozenset(("python",))
 _BLOCK_KEYWORDS = _RECURSIVE_BLOCK_KEYWORDS | _INLINE_BLOCK_KEYWORDS
-_NO_PARAM_BLOCK_KEYWORDS = frozenset(("python","else"))
-_PARAM_REQUIRED_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "while"))
+_ARG_NOT_REQUIRED_BLOCK_KEYWORDS = frozenset(("python", "else"))
+_ARG_REQUIRED_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "while"))
 _MANIFEST_FILENAME = ".blocklight-manifest.json"
-_HEADER_MARKER = "Compiled by Blocklight"
+
+# ----- Scoreboard reserved ----- #
 _BL_RESERVED_SCOREBOARD = "_bl"
 _BL_RETURNING_HOLDER = "#_bl_returning"
-_BL_SUCCESS_HOLDER = "#_bl_success"
-_BL_VALUE_HOLDER = "#_bl_value"
+_BL_SUCCESS_HOLDER = "#_bl_return_success"
+_BL_VALUE_HOLDER = "#_bl_return_value"
+
+# ----- Compiled output strings ----- #
+_HEADER_MARKER = "Compiled by Blocklight"
+_HEADER_TEXT = [
+    f"# {_HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)",
+    "# Changes saved to this file will not persist. Please modify the bl source file instead:",
+]
+# Catch that a child function returned, get return success and value then forward up the call chain
+_RET_HANDLER_FULL = [
+    f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}",  # noqa: E501
+    f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail",  # noqa: E501
+]
+# Catch that a child function returned and also return this function. Used as optimized middleman in call stack.
+_RET_HANDLER_PARTIAL = [f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return 0"]
+# Mark that child method decided to return
+_RET_MARK_RETURNING = f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1"
+# Set the return success and value holders and return something
+_RET_SET_HOLDERS = f"execute store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run return "  # noqa: E501
 
 
-# One line in source tracking original line number
+# One line in bl source tracking original line number
 class _Line(NamedTuple):
     text: str
     lineno: int
 
 
-# One source file's properties stored in the manifest
+# One bl source file's properties stored in the manifest
 class _ManifestSourceEntry(NamedTuple):
     source_hash: str
     outputs: frozenset[str]
@@ -79,36 +99,77 @@ class BLFatalError(BLError):  # Fatal error, stop compile of this concurrency.
     pass
 
 
-class BLSyntaxError(BLNonFatalError):  # Syntax error in function. Other functions in the file continue to compile.
+class BLFileError(BLNonFatalError):  # Raised on failures during file operations.
     pass
 
 
-class BLPythonError(BLNonFatalError):  # Raised while compiling a python: block; recoverable like BLSyntaxError.
+class BLSyntaxError(BLNonFatalError):  # Syntax error in bl function.
     pass
 
 
-class BLFileError(BLNonFatalError):  # Raised on failures during file operations
+class BLPythonError(BLNonFatalError):  # Raised while compiling a python: block.
     pass
 
 
-# Source contents and metadata surrounding an input file. The caller has always already read and
-# cleaned the lines by the time this gets built (see Compile._read_source), so it just takes them.
+# Contents and metadata surrounding a bl source file. Reads file from disk on init.
 @dataclass
 class SourceFile:
     local_path: str
-    source_lines: list[_Line]
-    namespace: str | None = None  # optional; surfaced to `python:` blocks as bl.NAMESPACE
+    namespace: str
+    source_lines: list[_Line] = field(init=False)
+
+    # Opens, reads, and cleans the source file. Logs and raises BLFileError on failure.
+    def __post_init__(self) -> None:
+        try:
+            with open(self.local_path, encoding="utf-8") as f:
+                self.source_lines = list(self._iter_clean_lines(enumerate(f, start=1)))
+        except (OSError, UnicodeDecodeError) as err:
+            detail = err.strerror if isinstance(err, OSError) and err.strerror else str(err)
+            error = BLFileError(f"Failed to read '{self.local_path}': {detail}.")
+            error.filename = self.local_path
+            tui.log_error(error)
+            raise error from err
+
+    # sha256 hash of bl source file's cleaned contents
+    @property
+    def content_hash(self) -> str:
+        hasher = hashlib.sha256()
+        for line in self.source_lines:
+            hasher.update(line.text.encode("utf-8"))
+            hasher.update(b"\n")
+        return hasher.hexdigest()
+
+    # Yeilds cleans lines from any (line number, raw text) source.
+    @staticmethod
+    def _iter_clean_lines(numbered_lines: Iterable[tuple[int, str]]) -> Iterator[_Line]:
+        pending: _Line | None = None
+        for line_number, raw_line in numbered_lines:
+            line = raw_line.rstrip()
+            lstrip_line = line.lstrip()
+
+            # Strip comment and whitespace lines
+            if lstrip_line.startswith("#") or len(lstrip_line) == 0:
+                continue
+
+            if pending is not None and pending.text.endswith("\\"):
+                pending = _Line(pending.text[:-1] + lstrip_line, pending.lineno)
+            else:
+                if pending is not None:
+                    yield pending
+                pending = _Line(line, line_number)
+        if pending is not None:
+            if pending.text.endswith("\\"):
+                pending = _Line(pending.text[:-1], pending.lineno)
+            yield pending
 
 
 # Compile-time options, owned and parsed by TUI.
 @dataclass(frozen=True)
 class CompilerOptions:
-    no_header: bool = False  # Omit the "Compiled by Blocklight" header comment from each output file
     no_python: bool = False  # Throw an error on `python:` blocks instead of executing them
-    no_symlink: bool = False  # Refuse to follow symlinked directories or read symlinked source files
-    verify_before_delete: bool = False  # Before deleting a stale output, confirm it has the Blocklight header
+    no_symlink: bool = False  # Refuse to follow symlinked directories or read symlinked bl source files
     dry_run: bool = False  # Compile in-memory only; do not write any files to disk
-    force: bool = False  # Recompile every source regardless of the cached hash
+    force: bool = False  # Recompile every bl source regardless of the cached hash
 
 
 # Read-only context threaded through the compilation of one block
@@ -168,17 +229,12 @@ class TUI:
         parser = argparse.ArgumentParser(prog="blocklight", description=__doc__)
         parser.add_argument("--version", action="version", version=f"Blocklight {_BL_VERSION_STRING}")
         parser.add_argument(
-            "--no-header",
-            action="store_true",
-            help='omit the "Compiled by Blocklight" header comment from each output file',
-        )
-        parser.add_argument(
             "--no-python", action="store_true", help="reject 'python:' blocks instead of executing them at compile time"
         )
         parser.add_argument(
             "--no-symlink",
             action="store_true",
-            help="refuse to follow symlinked directories or read symlinked source files",
+            help="refuse to follow symlinked directories or read symlinked bl source files",
         )
         parser.add_argument(
             "--safe",
@@ -196,30 +252,20 @@ class TUI:
             help="ignore manifest hashing and force recompile of all files",
         )
         args = parser.parse_args(argv)
-        # Dev builds and version bumps invalidate the cache themselves, same as an explicit --force.
-        force = args.force or _BL_IS_DEV_BUILD
         self.set_options(
             CompilerOptions(
-                no_header=args.no_header,
                 no_python=args.no_python or args.safe,
                 no_symlink=args.no_symlink or args.safe,
-                verify_before_delete=args.safe,
                 dry_run=args.dry_run,
-                force=force,
+                force=args.force,
             )
         )
-
-    def get_no_header(self) -> bool:
-        return self._options.no_header
 
     def get_no_python(self) -> bool:
         return self._options.no_python
 
     def get_no_symlink(self) -> bool:
         return self._options.no_symlink
-
-    def get_verify_before_delete(self) -> bool:
-        return self._options.verify_before_delete
 
     def get_dry_run(self) -> bool:
         return self._options.dry_run
@@ -326,7 +372,7 @@ class TUI:
 
 
 # Owns pack.mcmeta/manifest state, discovery, both thread pools, and every datapack-level
-# collection (compiled files, load/tick functions, source hashes/outputs, needs_recompile).
+# collection (compiled files, load/tick functions, bl source hashes/outputs, needs_recompile).
 class Orchestration:
     def __init__(self) -> None:
         self._pack_name: str = ""
@@ -355,8 +401,7 @@ class Orchestration:
     def get_tick_functions(self) -> frozenset[str]:
         return frozenset(self._tick_functions)
 
-    # The previous run's record for this source, if any. None means never compiled before (or
-    # its manifest entry was dropped/corrupt) -- Compile treats that like any other cache miss.
+    # The previous run's record for this bl source, if any.
     def get_previous_manifest_entry(self, local_path: str) -> _ManifestSourceEntry | None:
         return self._previous_manifest.sources.get(local_path) if self._previous_manifest else None
 
@@ -370,39 +415,34 @@ class Orchestration:
     def mark_needs_recompile(self, local_path: str) -> None:
         self._needs_recompile.add(local_path)
 
-    # Attribute, log, and force a recompile of `local_path` next run. The shared shape of every
-    # recoverable failure tied to a source (bad output path, write/delete failure, compile error).
+    # Log an error and force a recompile of `local_path` next run.
     def report_error(self, local_path: str, error: BLError) -> None:
         error.filename = local_path
         tui.log_error(error)
         self.mark_needs_recompile(local_path)
 
-    # Cache-hit path: carries a hash-unchanged source's previous outputs forward.
-    def reuse_previous_outputs(self, local_path: str) -> None:
+    # Re-registers one previously-produced output file without rewriting it.
+    def reuse_output_file(self, local_path: str, output: str) -> None:
+        self._files.add(output)
+        self._source_outputs.setdefault(local_path, set()).add(output)
+        tui.tick_discovered()
+        tui.tick_processed()
+        tui.tick_written()
         if self._previous_manifest is None:
             return
-        entry = self._previous_manifest.sources.get(local_path)
-        if entry is None:
-            return
-        for output in entry.outputs:
-            self._files.add(output)
-            self._source_outputs.setdefault(local_path, set()).add(output)
-            tui.tick_discovered()
-            tui.tick_processed()
-            tui.tick_written()
-            function_id = self._function_id(output)
-            if function_id in self._previous_manifest.load:
-                self.add_load_function(output)
-            if function_id in self._previous_manifest.tick:
-                self.add_tick_function(output)
+        function_id = self._function_id(output)
+        if function_id in self._previous_manifest.load:
+            self.register_load_function(output)
+        if function_id in self._previous_manifest.tick:
+            self.register_tick_function(output)
 
-    def add_load_function(self, function_output_filepath: str) -> None:
+    def register_load_function(self, function_output_filepath: str) -> None:
         self._load_functions.add(function_output_filepath)
 
-    def add_tick_function(self, function_output_filepath: str) -> None:
+    def register_tick_function(self, function_output_filepath: str) -> None:
         self._tick_functions.add(function_output_filepath)
 
-    # Validates namespace containment, then writes the file.
+    # Validates namespace containment, then writes the output file to disk using write executors.
     def write_output_file(
         self, filepath: str, contents: str, function_def_line: _Line, local_path: str, namespace: str
     ) -> None:
@@ -419,6 +459,7 @@ class Orchestration:
             return
         self._write_executor.submit(self._persist_file, filepath, contents, function_def_line, local_path)
 
+    # Writes output file to disk.
     def _persist_file(self, filepath: str, contents: str, function_def_line: _Line, local_path: str) -> None:
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -437,26 +478,30 @@ class Orchestration:
         self._source_outputs.setdefault(local_path, set()).add(filepath)
         tui.tick_written()
 
+    # Wait for all write executors to finish.
     def wait_for_writes(self) -> None:
         self._write_executor.shutdown(wait=True)
 
     # Delete one stale output file.
-    # Does not delete anything missing the Blocklight header, since the manifest could be stale or wrong.
+    # Does not delete anything missing the Blocklight header.
     def delete_stale_output(self, filepath: str, local_path: str) -> None:
         if not os.path.isfile(filepath):
             return
-        if tui.get_verify_before_delete() and not tui.get_no_header():
-            try:
-                with open(filepath, encoding="utf-8") as f:
-                    content = f.read()
-            except OSError as err:
-                error = BLFileError(f"Failed to verify '{filepath}' before deleting: {err.strerror}.")
-                self.report_error(local_path, error)
-                return
-            if _HEADER_MARKER not in content:
-                error = BLFileError(f"Refusing to delete '{filepath}': missing the Blocklight header.")
-                self.report_error(local_path, error)
-                return
+
+        # Verify header
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                content = f.read()
+        except OSError as err:
+            error = BLFileError(f"Failed to verify '{filepath}' before deleting: {err.strerror}.")
+            self.report_error(local_path, error)
+            return
+        if _HEADER_MARKER not in content:
+            error = BLFileError(f"Refusing to delete '{filepath}': missing the Blocklight header.")
+            self.report_error(local_path, error)
+            return
+
+        # Delete file
         try:
             os.remove(filepath)
         except OSError as err:
@@ -641,33 +686,21 @@ class Orchestration:
             self._write_manifest()
 
 
-# One instance per source file, constructed and run inside Orchestration's discovery pool.
+# One instance per bl source file, constructed and run inside Orchestration's discovery pool.
 class Compile:
     def __init__(self, local_path: str, namespace: str) -> None:
         self.local_path = local_path
         self.namespace = namespace
 
-    # Opens and reads the source file, determines if compile is needed, then deletes old output and recompiles
+    # Reads the bl source file, determines if compile is needed, then deletes old output and recompiles
     def run(self) -> None:
         tui.tick_discovered()
         try:
-            with open(self.local_path, encoding="utf-8") as f:
-                hasher = hashlib.sha256()
-                source_lines: list[_Line] = []
-                for line in self._iter_clean_lines(enumerate(f, start=1)):
-                    hasher.update(line.text.encode("utf-8"))
-                    hasher.update(b"\n")
-                    source_lines.append(line)
-                content_hash = hasher.hexdigest()
-        except (OSError, UnicodeDecodeError) as err:
-            # No entry gets recorded below, so this source is simply absent from the next
-            # manifest and gets a fresh attempt next run regardless of mark_needs_recompile.
-            detail = err.strerror if isinstance(err, OSError) and err.strerror else str(err)
-            error = BLFileError(f"Failed to read '{self.local_path}': {detail}.")
-            error.filename = self.local_path
-            tui.log_error(error)
+            sf = SourceFile(self.local_path, self.namespace)
+        except BLFileError:
             return
         tui.tick_processed()
+        content_hash = sf.content_hash
 
         previous_entry = orchestration.get_previous_manifest_entry(self.local_path)
         orchestration.record_source(self.local_path, content_hash)
@@ -675,12 +708,14 @@ class Compile:
 
         # Skip recompile of already-compiled files under circumstances considered safe
         if (
-            not _BL_IS_DEV_BUILD and
-            not tui.get_force() and
-            previous_compiler_version and previous_compiler_version == _BL_VERSION and
-            previous_entry is not None and previous_entry.source_hash == content_hash
+            not _BL_IS_DEV_BUILD
+            and not tui.get_force()
+            and previous_compiler_version == _BL_VERSION
+            and previous_entry is not None
+            and previous_entry.source_hash == content_hash
         ):
-            orchestration.reuse_previous_outputs(self.local_path)
+            for output in previous_entry.outputs:
+                orchestration.reuse_output_file(self.local_path, output)
             tui.tick_written()
             return
 
@@ -688,33 +723,8 @@ class Compile:
             for output in previous_entry.outputs:
                 orchestration.delete_stale_output(output, self.local_path)
 
-        sf = SourceFile(local_path=self.local_path, source_lines=source_lines, namespace=self.namespace)
         self.compile(sf)
         tui.tick_written()
-
-    # Cleans lines from any (line number, raw text) source. A continued line is only yielded
-    # once a non-continuing line ends it.
-    @staticmethod
-    def _iter_clean_lines(numbered_lines: Iterable[tuple[int, str]]) -> Iterator[_Line]:
-        pending: _Line | None = None
-        for line_number, raw_line in numbered_lines:
-            line = raw_line.rstrip()
-            lstrip_line = line.lstrip()
-
-            # Strip comment and whitespace lines
-            if lstrip_line.startswith("#") or len(lstrip_line) == 0:
-                continue
-
-            if pending is not None and pending.text.endswith("\\"):
-                pending = _Line(pending.text[:-1] + lstrip_line, pending.lineno)
-            else:
-                if pending is not None:
-                    yield pending
-                pending = _Line(line, line_number)
-        if pending is not None:
-            if pending.text.endswith("\\"):
-                pending = _Line(pending.text[:-1], pending.lineno)
-            yield pending
 
     # Compile every function in `sf`, isolating recoverable errors to the function that raised them.
     def compile(self, sf: SourceFile) -> None:
@@ -771,13 +781,18 @@ class Compile:
         namespace, path = function_name.split(":", 1)
         return f"data/{namespace}/function/{path}.mcfunction"
 
+    # Header lines every compiled output file (including helpers) begins with.
+    @staticmethod
+    def _header_lines(local_path: str, lineno: int) -> list[str]:
+        return [*_HEADER_TEXT, f"#     `{local_path}:{lineno}`"]
+
     # Validate a function header and compile its body to an mcfunction file.
     def _compile_function(self, sf: SourceFile, lines: list[_Line]) -> None:
         header = lines[0]
         header_split = header.text.split("function ")
         if len(header_split) <= 1:
             raise BLSyntaxError(
-                "This is being interpreted as a function header but does not declare a function. "
+                "This line is interpreted as a function header but does not declare a function. "
                 "Double-check indentation.",
                 header,
             )
@@ -794,20 +809,19 @@ class Compile:
             seen_keywords.add(word)
 
         # Validate function name
-        function_name = header_split[1]
-        if not function_name.endswith(":"):
-            raise BLSyntaxError("This function definition must end with ':'.", header)
-        function_name = function_name[:-1].strip()
+        function_name = header_split[1].strip()
         if not function_name:
             raise BLSyntaxError(
-                "This function definition does not declare a function name (e.g. 'function foo:')", header
+                "This function definition does not declare a function name (e.g. 'function foo')", header
             )
         if sorted(set(function_name) - _FUNCTION_NAME_CHARS):
             raise BLSyntaxError("Function names may only use a-z, 0-9, '_' and '-'", header)
 
-        if len(lines) == 1:  # header only: empty function produces no output
+        # Validate function actually has contents. No output otherwise.
+        if len(lines) == 1:
             return
 
+        # Determine output filepath
         _data, namespace, _src_root, *subdirs, source_file = sf.local_path.split("/")  # /data/<ns>/blocklight/*/f.bl
         if "root" in seen_keywords:
             function_path = function_name
@@ -817,50 +831,47 @@ class Compile:
         output_filepath = self._function_filepath(block_in.function_name)
         tui.tick_discovered()
 
+        # Build function and helpers
         block_out = _BlockOutput()
-        if not tui.get_no_header():
-            block_out.lines.append(
-                f"# {_HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)"
-            )
-            block_out.lines.append(
-                "# Changes saved to this file will not persist. Please modify the source file instead:"
-            )
-            block_out.lines.append(f"#     `{sf.local_path}:{header.lineno}`")
-        header_line_count = len(block_out.lines)
+        block_out.lines.extend(self._header_lines(sf.local_path, header.lineno))
         self._compile_lines(block_in, block_out, lines[1:], 1)
         if block_out.can_return:
-            # A return anywhere below may propagate all the way up to here; start clean so a stale
-            # flag left behind by some earlier, unrelated call chain can't be mistaken for ours.
+            # If compiled lines can return, reset the "is currently returning" flag on function call
             block_out.lines.insert(
-                header_line_count, f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 0"
+                len(_HEADER_TEXT) + 1,  # Insert after header text
+                f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 0",
             )
-        orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
         tui.tick_processed()
 
+        # Write output file to disk
+        orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
         if "load" in seen_keywords:
-            orchestration.add_load_function(output_filepath)
+            orchestration.register_load_function(output_filepath)
         if "tick" in seen_keywords:
-            orchestration.add_tick_function(output_filepath)
+            orchestration.register_tick_function(output_filepath)
 
-    # Compile the top-level commands in `lines` (at `depth`) + recursively compile child blocks
+    # Compile the commands in `lines` (at `depth`) + recursively compile child blocks
     def _compile_lines(self, block_in: _BlockInput, block_out: _BlockOutput, lines: list[_Line], depth: int) -> None:
-        counts: dict[str, int] = {}
+        counts: dict[str, int] = {}  # Local dict holding # of times each block header is used to name a helper method
+
+        # Iterate over commands and block headers at depth
+        # Spans are a list of one header _Line + child _Lines at greater indentation
         for span in self._iter_spans(lines, self._single_indent(block_in.sf), depth):
             line = span[0]
             text = line.text.lstrip()  # right is already stripped
-            keyword = text.split(maxsplit=1)[0].removesuffix(":")  # 'python:' / 'else:' carry the colon; others don't
-            args = text.partition(" ")[2].removesuffix(":")
+            keyword, _, args = text.partition(" ")
             has_keyword = keyword in _BLOCK_KEYWORDS
             has_body = len(span) > 1
 
+            # Handle block keywords
             if has_keyword:
                 if not has_body:
                     raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
-                if not text.endswith(":"):
-                    raise BLSyntaxError(f"'{keyword}' definition must begin a block with ':'.", line)
-                if keyword in _PARAM_REQUIRED_BLOCK_KEYWORDS and args == "":
+                if args.startswith(" "):
+                    raise BLSyntaxError("There are too many spaces between the keyword and the arguments.", line)
+                if keyword in _ARG_REQUIRED_BLOCK_KEYWORDS and args == "":
                     raise BLSyntaxError(f"'{keyword}' block requires arguments.")
-                if keyword in _NO_PARAM_BLOCK_KEYWORDS and args != "":
+                if keyword in _ARG_NOT_REQUIRED_BLOCK_KEYWORDS and args != "":
                     raise BLSyntaxError("'{keyword}' block does not take arguments.", line)
 
                 if keyword in _RECURSIVE_BLOCK_KEYWORDS:
@@ -868,11 +879,12 @@ class Compile:
                     if keyword in _MODIFIER_BLOCK_KEYWORDS:
                         # Recursively compile this block into
                         # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
-                        keyword_count = counts.get(keyword, 0) # Times this keyword been used in this function
+                        keyword_count = counts.get(keyword, 0)  # Times this keyword been used in this function
                         counts[keyword] = keyword_count + 1
                         child_function_name = f"{block_in.function_name}_helper/{keyword}_{keyword_count}"
                         new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
                         new_block_out = _BlockOutput()
+                        new_block_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
                         self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
                         tui.tick_processed()
                         orchestration.write_output_file(
@@ -885,13 +897,20 @@ class Compile:
 
                         # Determine what framework needs to be constructed around the child function call
                         macros_string = self._macros_with_clause(new_block_out.macros)  # Were macros used?
-                        if new_block_out.can_return:  # Could the child function run a return command?
+                        self._append_line_to_block_out(
+                            block_out,
+                            _Line(
+                                f"execute {keyword} {args} run function {child_function_name}{macros_string}",
+                                line.lineno,
+                            ),
+                        )
+
+                        # If the child function returns a value, immediately return.
+                        # Match success and return value if this is depth of 1 for proper propagation.
+                        if new_block_out.can_return:
                             block_out.can_return = True
-                            self._append_line_to_block_out(block_out, _Line(f"execute {keyword} {args} store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run function {child_function_name}{macros_string}", line.lineno))  # noqa: E501
-                            self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}", line.lineno))  # noqa: E501
-                            self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail", line.lineno))  # noqa: E501
-                        else:
-                            self._append_line_to_block_out(block_out, _Line(f"execute {keyword} {args} run function {child_function_name}{macros_string}", line.lineno))  # noqa: E501
+                            for handler_string in _RET_HANDLER_FULL if depth == 1 else _RET_HANDLER_PARTIAL:
+                                block_out.lines.append(handler_string)
                     else:
                         raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
                 elif keyword in _INLINE_BLOCK_KEYWORDS:
@@ -902,25 +921,31 @@ class Compile:
                     else:
                         raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
                 else:
-                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+                    raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
 
-            # Handle regular commands with body
+            # Raise error on regular commands with body
             elif has_body:
                 raise BLSyntaxError("Only block keywords may begin an indented block.", span[1])
 
             # Handle inline return commands
             elif text.startswith("execute ") and text.find(" run return ") != -1:
-                # Create a child helper file to call the inline return
                 split_result = text.split(" run return ")
                 if len(split_result) != 2:
                     raise BLSyntaxError("This 'execute' statement contains a malformed 'return' command.")
                 execute_command, return_command_tail = split_result
+
                 return_count = counts.get("return", 0)
                 counts["return"] = return_count + 1
+
+                # Create a child helper file to call the inline return
                 child_filepath = f"{block_in.function_name}_helper/return_{return_count}"
                 child_block_out = _BlockOutput()
-                self._append_line_to_block_out(child_block_out, _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno))  # noqa: E501
-                self._append_line_to_block_out(child_block_out, _Line(f"return {return_command_tail}", line.lineno))
+                child_block_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
+                child_block_out.lines.append(_RET_MARK_RETURNING)
+                self._append_line_to_block_out(
+                    child_block_out,
+                    _Line(_RET_SET_HOLDERS + return_command_tail, line.lineno),
+                )
                 orchestration.write_output_file(
                     self._function_filepath(child_filepath),
                     "\n".join(child_block_out.lines),
@@ -929,17 +954,26 @@ class Compile:
                     child_filepath.split(":", 1)[0],
                 )
 
-                # Build framework around original execute command
+                # Call the helper inline, forcing return if it runs.
                 block_out.can_return = True
-                self._append_line_to_block_out(block_out, _Line(f"{execute_command} store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run function {child_filepath}{self._macros_with_clause(child_block_out.macros)}", line.lineno))  # noqa: E501
-                self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}", line.lineno))  # noqa: E501
-                self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail", line.lineno))  # noqa: E501
+                macros_string = self._macros_with_clause(child_block_out.macros)
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(
+                        f"{execute_command} run return run function {child_filepath}{macros_string}",
+                        line.lineno,
+                    ),
+                )
 
             # Handle regular return commands
             elif text.startswith("return "):
                 block_out.can_return = True
-                self._append_line_to_block_out(block_out, _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno))  # noqa: E501
-                self._append_line_to_block_out(block_out, line)
+                return_command_tail = text[len("return ") :]
+                block_out.lines.append(_RET_MARK_RETURNING)
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(_RET_SET_HOLDERS + return_command_tail, line.lineno),
+                )
 
             # Handle regular commands
             else:

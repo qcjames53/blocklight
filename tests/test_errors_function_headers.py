@@ -16,7 +16,7 @@ say hello
 
 def test_header_declares_function_twice():
     out = compile_source("""\
-function function foo:
+function function foo
     say hi
 """)
     assert len(out.errors) == 1
@@ -27,7 +27,7 @@ function function foo:
 
 def test_unknown_header_keyword():
     out = compile_source("""\
-foo function hello:
+foo function hello
     say hi
 """)
     assert len(out.errors) == 1
@@ -38,18 +38,7 @@ foo function hello:
 
 def test_duplicate_header_keyword():
     out = compile_source("""\
-load load function hello:
-    say hi
-""")
-    assert len(out.errors) == 1
-    assert isinstance(out.errors[0], blocklight.BLSyntaxError)
-    assert out.errors[0].lineno == 1
-    assert out.file_contents == {}
-
-
-def test_header_missing_colon():
-    out = compile_source("""\
-function hello
+load load function hello
     say hi
 """)
     assert len(out.errors) == 1
@@ -71,7 +60,7 @@ function :
 
 def test_function_name_has_illegal_characters():
     out = compile_source("""\
-function hello@all:
+function hello@all
     say hi
 """)
     assert len(out.errors) == 1

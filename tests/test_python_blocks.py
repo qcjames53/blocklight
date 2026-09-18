@@ -2,10 +2,10 @@
 # pyright: reportPrivateUsage=false
 
 import blocklight
-from tests.helpers import NO_HEADER, Result, compile_source
+from tests.helpers import DEFAULT_OPTIONS, Result, compile_source
 
 
-def _compile(source: str, *, options: blocklight.CompilerOptions = NO_HEADER) -> Result:
+def _compile(source: str, *, options: blocklight.CompilerOptions = DEFAULT_OPTIONS) -> Result:
     return compile_source(
         source,
         local_path="data/bl_example/blocklight/python.bl",
@@ -18,8 +18,8 @@ def _compile(source: str, *, options: blocklight.CompilerOptions = NO_HEADER) ->
 
 def test_python_block_emit_repeats_a_command():
     out = _compile("""\
-function hardcode_example:
-    python:
+function hardcode_example
+    python
         for i in range(3):
             emit("say hi")
 """)
@@ -31,8 +31,8 @@ function hardcode_example:
 
 def test_python_block_emit_uses_compile_time_logic():
     out = _compile("""\
-function grid:
-    python:
+function grid
+    python
         for i in range(3):
             x = f"~{i}" if i else "~"
             emit(f"setblock {x} ~ ~ stone")
@@ -47,9 +47,9 @@ function grid:
 
 def test_python_block_interleaves_with_plain_commands():
     out = _compile("""\
-function mixed:
+function mixed
     say before
-    python:
+    python
         emit("say from python")
     say after
 """)
@@ -61,8 +61,8 @@ function mixed:
 
 def test_python_block_with_no_body_is_a_syntax_error():
     out = _compile("""\
-function empty:
-    python:
+function empty
+    python
     say after
 """)
     assert len(out.errors) == 1
@@ -73,8 +73,8 @@ function empty:
 
 def test_python_block_emits_all_bl_constants():
     out = _compile("""\
-function locators_example:
-    python:
+function locators_example
+    python
         emit(f"say Relative filepath: '{bl.PATH}'")
         emit(f"say Datapack name: '{bl.PACK_NAME}'")
         emit(f"say Datapack format: '{bl.PACK_FORMAT}'")
@@ -102,8 +102,8 @@ function locators_example:
 
 def test_python_block_emitted_commands_get_macro_handling():
     out = _compile("""\
-function macro_emit:
-    python:
+function macro_emit
+    python
         emit("say hi $(name)")
 """)
     assert out.errors == []
@@ -112,22 +112,22 @@ function macro_emit:
 
 def test_invalid_python_is_reported_as_bl_python_error():
     out = _compile("""\
-function broken:
-    python:
+function broken
+    python
         emit("say hi"
 """)
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLPythonError)
-    assert out.errors[0].lineno == 2  # points at the python: header
+    assert out.errors[0].lineno == 2  # points at the python header
     assert out.file_contents == {}
 
 
 def test_python_runtime_error_is_reported_and_isolated():
     out = _compile("""\
-function py_error:
-    python:
+function py_error
+    python
         raise ValueError("nope")
-function fine:
+function fine
     say ok
 """)
     assert len(out.errors) == 1
@@ -138,8 +138,8 @@ function fine:
 
 def test_python_block_that_emits_nothing_produces_an_empty_function():
     out = _compile("""\
-function silent:
-    python:
+function silent
+    python
         x = 1
 """)
     assert out.errors == []
@@ -149,11 +149,11 @@ function silent:
 def test_emitted_output_is_recompiled_as_blocklight_source():
     # An emit()ed line that looks like a block keyword is routed back through the compiler, not
     # passed through verbatim. `if` blocks aren't implemented yet, so this surfaces that error
-    # rather than writing a bogus "if condition:" command line.
+    # rather than writing a bogus "if condition" command line.
     out = _compile("""\
-function foo:
-    python:
-        emit("if condition:")
+function foo
+    python
+        emit("if condition")
         emit("    say hi")
     say bye
 """)
@@ -166,16 +166,16 @@ function foo:
 def test_no_python_option_rejects_python_blocks():
     out = _compile(
         """\
-function uses_python:
-    python:
+function uses_python
+    python
         emit("say hi")
-function plain:
+function plain
     say ok
 """,
-        options=blocklight.CompilerOptions(no_python=True, no_header=True),
+        options=blocklight.CompilerOptions(no_python=True),
     )
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
-    assert out.errors[0].lineno == 2  # points at the python: header
+    assert out.errors[0].lineno == 2  # points at the python header
     assert "disabled due to your compile parameters" in str(out.errors[0])
     assert out.file_contents == {"data/bl_example/function/python/plain.mcfunction": "say ok"}

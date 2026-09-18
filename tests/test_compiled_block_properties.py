@@ -2,13 +2,13 @@
 # pyright: reportPrivateUsage=false
 
 import blocklight
-from tests.helpers import NO_HEADER, build_lines, compile_source, reset_for_test, stub_disk_writes
+from tests.helpers import compile_source, make_source_file, reset_for_test, stub_disk_writes
 
 
 def _props(source: str) -> blocklight._BlockOutput:
     # Compile the body of the first (only) function and return its accumulated output.
-    reset_for_test(NO_HEADER)
-    sf = blocklight.SourceFile(local_path="data/pack/blocklight/main.bl", source_lines=build_lines(source))
+    reset_for_test()
+    sf = make_source_file("data/pack/blocklight/main.bl", source)
     block_out = blocklight._BlockOutput()
     compile_ = blocklight.Compile("data/pack/blocklight/main.bl", "pack")
     with stub_disk_writes():
@@ -36,7 +36,7 @@ def test_iter_macro_names_allows_full_charset():
 
 def test_macro_line_gets_dollar_prefix():
     out = compile_source("""\
-function hello:
+function hello
     say hi $(name)
 """)
     assert out.errors == []
@@ -45,7 +45,7 @@ function hello:
 
 def test_macro_line_existing_dollar_prefix():
     out = compile_source("""\
-function hello:
+function hello
     $say hi $(name)
 """)
     assert out.errors == []
@@ -54,7 +54,7 @@ function hello:
 
 def test_plain_line_is_untouched():
     out = compile_source("""\
-function hello:
+function hello
     say hello
 """)
     assert out.errors == []
@@ -63,7 +63,7 @@ function hello:
 
 def test_macros_recorded_on_properties():
     props = _props("""\
-function hello:
+function hello
     say $(greeting) $(name)
     playsound x block @s ~ ~ ~ 1 $(pitch)
 """)
@@ -72,7 +72,7 @@ function hello:
 
 def test_no_macros_leaves_property_empty():
     props = _props("""\
-function hello:
+function hello
     say hello
 """)
     assert props.macros == set()
@@ -80,7 +80,7 @@ function hello:
 
 def test_dollar_prefix_without_macro_is_an_error():
     out = compile_source("""\
-function hello:
+function hello
     say ok
     $say no macro here
 """)
@@ -92,7 +92,7 @@ function hello:
 
 def test_unclosed_macro_is_an_error_at_its_source_line():
     out = compile_source("""\
-function hello:
+function hello
     say ok
     say $(unclosed
 """)
@@ -104,7 +104,7 @@ function hello:
 
 def test_empty_macro_is_an_error():
     out = compile_source("""\
-function hello:
+function hello
     say $()
 """)
     assert len(out.errors) == 1
@@ -114,7 +114,7 @@ function hello:
 
 def test_macro_name_rejects_invalid_characters():
     for bad in ("a b", "a-b", "a.b"):
-        out = compile_source(f"function hello:\n    say $({bad})\n")
+        out = compile_source(f"function hello\n    say $({bad})\n")
         assert len(out.errors) == 1
         assert isinstance(out.errors[0], blocklight.BLSyntaxError)
         assert out.errors[0].lineno == 2
@@ -123,7 +123,7 @@ def test_macro_name_rejects_invalid_characters():
 
 def test_can_return_true_when_body_returns_a_value():
     props = _props("""\
-function meaning_of_life:
+function meaning_of_life
     return 42
 """)
     assert props.can_return is True
@@ -133,7 +133,7 @@ def test_can_return_true_for_return_embedded_in_an_execute_chain():
     # Bare `return` with no argument isn't valid vanilla syntax (verified in-game) -- the three
     # real forms (`return <value>`, `return fail`, `return run <command>`) all take an argument.
     props = _props("""\
-function f:
+function f
     execute if score #x tmp matches 1 run return fail
 """)
     assert props.can_return is True
@@ -141,7 +141,7 @@ function f:
 
 def test_can_return_false_without_a_return():
     props = _props("""\
-function f:
+function f
     say hi
     scoreboard players set #x tmp 1
 """)

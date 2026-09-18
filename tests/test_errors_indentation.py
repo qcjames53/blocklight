@@ -16,7 +16,7 @@ def test_file_must_begin_with_function_definition():
 
 def test_indent_schema_must_be_at_least_two_spaces():
     out = compile_source("""\
-function hello:
+function hello
  say hi
 """)
     assert len(out.errors) == 1
@@ -26,7 +26,7 @@ function hello:
 
 
 def test_indent_schema_may_not_mix_tabs_and_spaces():
-    out = compile_source("function hello:\n\t say hi\n")
+    out = compile_source("function hello\n\t say hi\n")
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLFatalError)
     assert out.errors[0].lineno == 2
@@ -35,7 +35,7 @@ def test_indent_schema_may_not_mix_tabs_and_spaces():
 
 def test_body_line_under_indented():
     out = compile_source("""\
-function hello:
+function hello
     say a
   say b
 """)
@@ -49,9 +49,9 @@ def test_body_line_over_indented():
     # Indent unit is settled as two spaces by 'function a'; 'function b' then opens
     # its body four spaces deep, which is over-indented for the first body line.
     out = compile_source("""\
-function a:
+function a
   say a
-function b:
+function b
     say b
 """)
     assert len(out.errors) == 1

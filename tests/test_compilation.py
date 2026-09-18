@@ -2,21 +2,21 @@
 # pyright: reportPrivateUsage=false
 
 import blocklight
-from tests.helpers import NO_HEADER, compile_source
+from tests.helpers import DEFAULT_OPTIONS, compile_source
 
 
 def _compile(
     source: str,
     *,
     local_path: str = "data/hello_world/blocklight/main.bl",
-    options: blocklight.CompilerOptions = NO_HEADER,
+    options: blocklight.CompilerOptions = DEFAULT_OPTIONS,
 ):
     return compile_source(source, local_path=local_path, options=options)
 
 
 def test_basic_function():
     out = _compile("""\
-function hello:
+function hello
     say Hello, world!
 """)
     assert out.errors == []
@@ -25,12 +25,12 @@ function hello:
 
 def test_modifier_block_compiles_to_numbered_helper_function():
     out = _compile("""\
-function hello:
-    at @s:
+function hello
+    at @s
         say hi
-    positioned ~ ~ ~:
+    positioned ~ ~ ~
         say a
-    positioned ~ ~1 ~:
+    positioned ~ ~1 ~
         say b
 """)
     assert out.errors == []
@@ -51,7 +51,7 @@ function hello:
 def test_header_is_rendered_by_default():
     out = _compile(
         """\
-function hello:
+function hello
     say Hello, world!
 """,
         options=blocklight.CompilerOptions(),
@@ -60,17 +60,17 @@ function hello:
     expected = "\n".join(
         [
             f"# Compiled by Blocklight {blocklight._BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)",
-            "# Changes saved to this file will not persist. Please modify the source file instead:",
+            "# Changes saved to this file will not persist. Please modify the bl source file instead:",
             "#     `data/hello_world/blocklight/main.bl:1`",
             "say Hello, world!",
         ]
     )
-    assert out.file_contents == {"data/hello_world/function/main/hello.mcfunction": expected}
+    assert out.raw_file_contents == {"data/hello_world/function/main/hello.mcfunction": expected}
 
 
 def test_basic_root_function():
     out = _compile("""\
-root function hello:
+root function hello
     say Hello, world!
 """)
     assert out.errors == []
@@ -80,7 +80,7 @@ root function hello:
 def test_basic_function_filepath():
     out = _compile(
         """\
-function hello:
+function hello
     say Hello, world!
 """,
         local_path="data/foo/blocklight/bar/baz.bl",
@@ -91,7 +91,7 @@ function hello:
 
 def test_function_funky_name():
     out = _compile("""\
-function abcdefghijklmnopqrstuvwxyz_-0123456789:
+function abcdefghijklmnopqrstuvwxyz_-0123456789
     say Hello, world!
 """)
     assert out.errors == []
@@ -102,7 +102,7 @@ function abcdefghijklmnopqrstuvwxyz_-0123456789:
 
 def test_multi_statement_body():
     out = _compile("""\
-function hello:
+function hello
     say one
     say two
     say three
@@ -113,7 +113,7 @@ function hello:
 
 def test_load_keyword_accepted():
     out = _compile("""\
-load function setup:
+load function setup
     say loading
 """)
     assert out.errors == []
@@ -122,7 +122,7 @@ load function setup:
 
 def test_tick_keyword_accepted():
     out = _compile("""\
-tick function loop:
+tick function loop
     say ticking
 """)
     assert out.errors == []
@@ -131,7 +131,7 @@ tick function loop:
 
 def test_multiple_header_keywords():
     out = _compile("""\
-root load function setup:
+root load function setup
     say loading
 """)
     assert out.errors == []
@@ -140,7 +140,7 @@ root load function setup:
 
 def test_line_continuation_in_body():
     out = _compile("""\
-function hello:
+function hello
     say the quick \\
         brown fox
 """)
@@ -150,7 +150,7 @@ function hello:
 
 def test_comments_and_blank_lines_ignored_in_body():
     out = _compile("""\
-function hello:
+function hello
     # a leading note
     say one
 
@@ -163,7 +163,7 @@ function hello:
 
 def test_error_line_numbers_count_blank_and_comment_lines():
     out = _compile("""\
-function hello:
+function hello
     say one
 
     # filler that must still be counted
@@ -176,7 +176,7 @@ function hello:
 
 
 def test_tab_indentation_allowed():
-    out = _compile("function hello:\n\tsay one\n\tsay two\n")
+    out = _compile("function hello\n\tsay one\n\tsay two\n")
     assert out.errors == []
     assert out.file_contents == {"data/hello_world/function/main/hello.mcfunction": "say one\nsay two"}
 
@@ -189,8 +189,8 @@ def test_empty_file_produces_no_output():
 
 def test_empty_function_produces_no_output():
     out = _compile("""\
-function a:
-function b:
+function a
+function b
     say Hello, world!
 """)
     assert out.errors == []
@@ -200,9 +200,9 @@ function b:
 def test_syntax_error_isolation():
     # A recoverable error in one function does not stop the others compiling.
     out = _compile("""\
-function one:
+function one
     say Hello, world!
-function two:
+function two
      say Hello, world!
 """)
     assert len(out.errors) == 1
@@ -214,9 +214,9 @@ function two:
 def test_fatal_error_prevents_all_output():
     # A fatal error abandons the whole file, even functions that already compiled.
     out = _compile("""\
-function one:
+function one
  say Hello, world!
-function two:
+function two
     say Hello, world!
 """)
     assert len(out.errors) == 1
@@ -227,9 +227,9 @@ function two:
 
 def test_errors_carry_filename_and_source_text():
     out = _compile("""\
-function one:
+function one
     say Hello, world!
-function two:
+function two
      say Hello, world!
 """)
     assert len(out.errors) == 1
@@ -241,7 +241,7 @@ function two:
 
 def test_fatal_error_carries_filename_and_source_text():
     out = _compile("""\
-function one:
+function one
  say Hello, world!
 """)
     assert len(out.errors) == 1

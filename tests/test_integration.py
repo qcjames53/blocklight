@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import blocklight
+from tests.helpers import strip_header
 
 _BLOCKLIGHT_SCRIPT = Path(__file__).resolve().parents[1] / "blocklight.py"
 _EXAMPLE_PACK = Path(__file__).resolve().parent / "example_pack"
@@ -44,11 +45,10 @@ _EXPECTED_FILE_CONTENTS = {
         '$function bl_example:macros/macros_demo_b with {"a": "$(a)"}'
     ),
     "data/bl_example/function/macros/macros_demo_a_helper/as_0.mcfunction": (
-        '$execute at @s run function bl_example:macros/macros_demo_a_helper/as_0_helper/at_0 '
-        'with {"a": "$(a)"}'
+        '$execute at @s run function bl_example:macros/macros_demo_a_helper/as_0_helper/at_0 with {"a": "$(a)"}'
     ),
     "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0.mcfunction": (
-        '$execute positioned ~ ~ ~ run function '
+        "$execute positioned ~ ~ ~ run function "
         'bl_example:macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0 with {"a": "$(a)"}'
     ),
     "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0.mcfunction": (
@@ -86,7 +86,7 @@ def test_compiles_example_pack() -> None:
     _GENERATED_MANIFEST.unlink(missing_ok=True)
 
     result = subprocess.run(
-        [sys.executable, str(_BLOCKLIGHT_SCRIPT), "--no-header"],
+        [sys.executable, str(_BLOCKLIGHT_SCRIPT)],
         cwd=_EXAMPLE_PACK,
         capture_output=True,
         text=True,
@@ -97,6 +97,6 @@ def test_compiles_example_pack() -> None:
         assert fragment in result.stderr
 
     for relative_path, contents in _EXPECTED_FILE_CONTENTS.items():
-        assert (_EXAMPLE_PACK / relative_path).read_text() == contents
+        assert strip_header((_EXAMPLE_PACK / relative_path).read_text()) == contents
     for relative_path in _EXPECTED_MISSING_FILES:
         assert not (_EXAMPLE_PACK / relative_path).exists()

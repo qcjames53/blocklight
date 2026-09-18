@@ -1,6 +1,7 @@
 # Helpers for unit test suite
 
 import contextlib
+import io
 import os
 import tempfile
 import unittest.mock
@@ -10,26 +11,55 @@ from typing import NamedTuple
 
 import blocklight
 
-NO_HEADER = blocklight.CompilerOptions(no_header=True)
+DEFAULT_OPTIONS = blocklight.CompilerOptions()
 
 
 # A snapshot of everything a test typically wants to assert on, taken right after a compile.
 class Result(NamedTuple):
     errors: list[blocklight.BLError]
     file_contents: dict[str, str]
+    raw_file_contents: dict[str, str]
     files: frozenset[str]
     load_functions: frozenset[str]
     tick_functions: frozenset[str]
 
 
 def build_lines(source: str) -> list[blocklight._Line]:  # pyright: ignore[reportPrivateUsage]
-    return list(blocklight.Compile._iter_clean_lines(enumerate(source.split("\n"), start=1)))  # pyright: ignore[reportPrivateUsage]
+    return list(blocklight.SourceFile._iter_clean_lines(enumerate(source.split("\n"), start=1)))  # pyright: ignore[reportPrivateUsage]
+
+
+# Builds a SourceFile from an in-memory string instead of a real file: SourceFile.__post_init__
+# always reads local_path off disk, so this stubs `open` just for that one read.
+def make_source_file(local_path: str, source: str, namespace: str | None = None) -> blocklight.SourceFile:
+    def fake_open(filepath: str, mode: str = "r", *args: object, **kwargs: object) -> io.StringIO:
+        assert filepath == local_path and mode == "r"
+        return io.StringIO(source)
+
+    with unittest.mock.patch("blocklight.open", fake_open, create=True):
+        return blocklight.SourceFile(local_path=local_path, namespace=namespace)  # pyright: ignore[reportArgumentType]
+
+
+# Strips the 3-line Blocklight header (always present on top-level function output) if present,
+# so tests can assert on clean body content regardless of it.
+def strip_header(content: str) -> str:
+    lines = content.split("\n")
+    header_lines = blocklight._HEADER_TEXT  # pyright: ignore[reportPrivateUsage]
+    if (
+        len(lines) >= 3
+        and lines[0] == header_lines[0]
+        and lines[1] == header_lines[1]
+        and lines[2].startswith("#     `")
+    ):
+        return "\n".join(lines[3:])
+    return content
 
 
 def _snapshot(file_contents: dict[str, str] | None = None) -> Result:
+    raw = dict(file_contents) if file_contents is not None else {}
     return Result(
         errors=blocklight.tui.get_errors(),
-        file_contents=dict(file_contents) if file_contents is not None else {},
+        file_contents={path: strip_header(content) for path, content in raw.items()},
+        raw_file_contents=raw,
         files=blocklight.orchestration.get_files(),
         load_functions=blocklight.orchestration.get_load_functions(),
         tick_functions=blocklight.orchestration.get_tick_functions(),
@@ -91,7 +121,7 @@ def stub_disk_writes() -> Generator[dict[str, str], None, None]:
 
 # Fresh global TUI/Orchestration for test isolation, with a single-worker write pool so writes to
 # colliding paths resolve in submission order instead of racing across threads.
-def reset_for_test(options: blocklight.CompilerOptions = NO_HEADER) -> None:
+def reset_for_test(options: blocklight.CompilerOptions = DEFAULT_OPTIONS) -> None:
     blocklight.reset_globals()
     blocklight.tui.set_options(options)
     blocklight.orchestration._write_executor = ThreadPoolExecutor(max_workers=1)  # pyright: ignore[reportPrivateUsage]
@@ -103,7 +133,7 @@ def compile_source(
     source: str,
     *,
     local_path: str = "data/pack/blocklight/main.bl",
-    options: blocklight.CompilerOptions = NO_HEADER,
+    options: blocklight.CompilerOptions = DEFAULT_OPTIONS,
     pack_name: str | None = None,
     pack_format: int | None = None,
     namespace: str | None = None,
@@ -114,7 +144,7 @@ def compile_source(
     if pack_format is not None:
         blocklight.orchestration._pack_format = pack_format  # pyright: ignore[reportPrivateUsage]
     compile_ = blocklight.Compile(local_path, local_path.split("/")[1])
-    sf = blocklight.SourceFile(local_path=local_path, source_lines=build_lines(source), namespace=namespace)
+    sf = make_source_file(local_path, source, namespace)
     with stub_disk_writes() as written:
         compile_.compile(sf)
         blocklight.orchestration.wait_for_writes()
@@ -123,7 +153,7 @@ def compile_source(
 
 # Run a full discover-and-compile pass (pack.mcmeta + data/ discovery) in the current directory.
 # Writes go to real disk: manifest/staleness tests depend on real persistence across runs.
-def run_compile(options: blocklight.CompilerOptions = NO_HEADER) -> Result:
+def run_compile(options: blocklight.CompilerOptions = DEFAULT_OPTIONS) -> Result:
     blocklight.reset_globals()
     blocklight.tui.set_options(options)
     blocklight.orchestration.run()
