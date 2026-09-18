@@ -40,18 +40,6 @@ function hello:
     assert out.file_contents == {}
 
 
-def test_modifier_block_not_yet_implemented():
-    out = compile_source("""\
-function hello:
-    at @s:
-        say hi
-""")
-    assert len(out.errors) == 1
-    assert isinstance(out.errors[0], blocklight.BLSyntaxError)
-    assert out.errors[0].lineno == 2
-    assert out.file_contents == {}
-
-
 def test_plain_statement_may_not_open_an_indented_block():
     out = compile_source("""\
 function hello:

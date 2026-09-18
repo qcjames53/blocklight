@@ -23,6 +23,31 @@ function hello:
     assert out.file_contents == {"data/hello_world/function/main/hello.mcfunction": "say Hello, world!"}
 
 
+def test_modifier_block_compiles_to_numbered_helper_function():
+    out = _compile("""\
+function hello:
+    at @s:
+        say hi
+    positioned ~ ~ ~:
+        say a
+    positioned ~ ~1 ~:
+        say b
+""")
+    assert out.errors == []
+    assert out.file_contents == {
+        "data/hello_world/function/main/hello.mcfunction": "\n".join(
+            [
+                "execute at @s run function hello_world:main/hello_helper/at_0",
+                "execute positioned ~ ~ ~ run function hello_world:main/hello_helper/positioned_0",
+                "execute positioned ~ ~1 ~ run function hello_world:main/hello_helper/positioned_1",
+            ]
+        ),
+        "data/hello_world/function/main/hello_helper/at_0.mcfunction": "say hi",
+        "data/hello_world/function/main/hello_helper/positioned_0.mcfunction": "say a",
+        "data/hello_world/function/main/hello_helper/positioned_1.mcfunction": "say b",
+    }
+
+
 def test_header_is_rendered_by_default():
     out = _compile(
         """\
@@ -34,9 +59,9 @@ function hello:
     assert out.errors == []
     expected = "\n".join(
         [
-            f"# Compiled by Blocklight {blocklight._BL_VERSION} (https://github.com/qcjames53/blocklight)",
+            f"# Compiled by Blocklight {blocklight._BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)",
             "# Changes saved to this file will not persist. Please modify the source file instead:",
-            "#     `data/hello_world/blocklight/main.bl`",
+            "#     `data/hello_world/blocklight/main.bl:1`",
             "say Hello, world!",
         ]
     )

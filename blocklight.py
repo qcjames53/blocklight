@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Blocklight - A blazing fast mcfunction microcompiler"""
 
 import argparse
@@ -15,20 +16,30 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import NamedTuple, cast
 
-_BL_VERSION = "1.0.dev"
+# Tweakable constants
+_BL_VERSION = (1, 0)
+_BL_IS_DEV_BUILD = True
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
+_FILE_WRITE_WORKERS_COUNT = 8
 
+_BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
 _MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")
 _FUNCTION_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))
 _MODIFIER_BLOCK_KEYWORDS = frozenset(
     ("align", "anchored", "as", "at", "facing", "in", "on", "positioned", "rotated", "summon")
 )
-_CONDITION_BLOCK_KEYWORDS = frozenset(("if", "elif", "else", "while"))
-_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | _CONDITION_BLOCK_KEYWORDS | {"python"}
-_FILE_WRITE_WORKERS_COUNT = 8
+_RECURSIVE_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "else", "while"))
+_INLINE_BLOCK_KEYWORDS = frozenset(("python",))
+_BLOCK_KEYWORDS = _RECURSIVE_BLOCK_KEYWORDS | _INLINE_BLOCK_KEYWORDS
+_NO_PARAM_BLOCK_KEYWORDS = frozenset(("python", "else"))
+_PARAM_REQUIRED_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "while"))
 _MANIFEST_FILENAME = ".blocklight-manifest.json"
 _HEADER_MARKER = "Compiled by Blocklight"
+_BL_RESERVED_SCOREBOARD = "_bl"
+_BL_RETURNING_HOLDER = "#_bl_returning"
+_BL_SUCCESS_HOLDER = "#_bl_success"
+_BL_VALUE_HOLDER = "#_bl_value"
 
 
 # One line in source tracking original line number
@@ -49,6 +60,7 @@ class _Manifest(NamedTuple):
     sources: dict[str, _ManifestSourceEntry]
     load: frozenset[str]
     tick: frozenset[str]
+    version: tuple[int, int]
 
 
 class BLError(SyntaxError):
@@ -96,16 +108,18 @@ class CompilerOptions:
     no_symlink: bool = False  # Refuse to follow symlinked directories or read symlinked source files
     verify_before_delete: bool = False  # Before deleting a stale output, confirm it has the Blocklight header
     dry_run: bool = False  # Compile in-memory only; do not write any files to disk
+    force: bool = False  # Recompile every source regardless of the cached hash
 
 
-# Read-only context threaded through the compilation of one function.
+# Read-only context threaded through the compilation of one block
 @dataclass
 class _BlockInput:
     sf: SourceFile
-    function_name: str
+    source_function_name: str  # Name of the top-level function from the function def
+    function_name: str  # Name of the output function this block will compile into
 
 
-# Mutable accumulator built up while compiling a function body.
+# Mutable accumulator built up while compiling one block.
 @dataclass
 class _BlockOutput:
     lines: list[str] = field(default_factory=list[str])  # compiled mcfunction command lines
@@ -122,13 +136,12 @@ class _PythonBlockContext:
         self.NAMESPACE = sf.namespace
         self.PACK_NAME = orchestration.get_pack_name()
         self.PACK_FORMAT = orchestration.get_pack_format()
-        self.FUNCTION = block_in.function_name
-        self.BLOCKLIGHT_VERSION = _BL_VERSION
+        self.FUNCTION_NAME = block_in.source_function_name
+        self.OUTPUT_FUNCTION_NAME = block_in.function_name
+        self.BLOCKLIGHT_VERSION = _BL_VERSION_STRING
 
 
-# Parses CLI args and is the sole recipient of every BLError raised anywhere in the compiler.
-# Also owns the live progress footer: a spinner line pinned to the bottom of the terminal, driven
-# by the three tick_* counters and redrawn on its own thread, independent of tick arrival rate.
+# Parses CLI args and drives user-facing progress UI
 class TUI:
     _SPINNER_FRAMES = "|/-\\"
     _REDRAW_INTERVAL = 1 / 15
@@ -153,7 +166,7 @@ class TUI:
 
     def parse_args(self, argv: list[str] | None = None) -> None:
         parser = argparse.ArgumentParser(prog="blocklight", description=__doc__)
-        parser.add_argument("--version", action="version", version=f"Blocklight {_BL_VERSION}")
+        parser.add_argument("--version", action="version", version=f"Blocklight {_BL_VERSION_STRING}")
         parser.add_argument(
             "--no-header",
             action="store_true",
@@ -177,7 +190,14 @@ class TUI:
             action="store_true",
             help="test compile without writing any files to disk",
         )
+        parser.add_argument(
+            "--force",
+            action="store_true",
+            help="ignore manifest hashing and force recompile of all files",
+        )
         args = parser.parse_args(argv)
+        # Dev builds and version bumps invalidate the cache themselves, same as an explicit --force.
+        force = args.force or _BL_IS_DEV_BUILD
         self.set_options(
             CompilerOptions(
                 no_header=args.no_header,
@@ -185,6 +205,7 @@ class TUI:
                 no_symlink=args.no_symlink or args.safe,
                 verify_before_delete=args.safe,
                 dry_run=args.dry_run,
+                force=force,
             )
         )
 
@@ -202,6 +223,9 @@ class TUI:
 
     def get_dry_run(self) -> bool:
         return self._options.dry_run
+
+    def get_force(self) -> bool:
+        return self._options.force
 
     # Thread safe
     def log_error(self, error: BLError) -> None:
@@ -307,7 +331,7 @@ class Orchestration:
     def __init__(self) -> None:
         self._pack_name: str = ""
         self._pack_format: int | None = None
-        self._previous: _Manifest = _Manifest(sources={}, load=frozenset(), tick=frozenset())
+        self._previous_manifest: _Manifest | None = None
         self._files: set[str] = set()
         self._load_functions: set[str] = set()
         self._tick_functions: set[str] = set()
@@ -333,8 +357,11 @@ class Orchestration:
 
     # The previous run's record for this source, if any. None means never compiled before (or
     # its manifest entry was dropped/corrupt) -- Compile treats that like any other cache miss.
-    def get_previous_entry(self, local_path: str) -> _ManifestSourceEntry | None:
-        return self._previous.sources.get(local_path)
+    def get_previous_manifest_entry(self, local_path: str) -> _ManifestSourceEntry | None:
+        return self._previous_manifest.sources.get(local_path) if self._previous_manifest else None
+
+    def get_previous_compiler_version(self) -> tuple[int, int] | None:
+        return self._previous_manifest.version if self._previous_manifest else None
 
     def record_source(self, local_path: str, content_hash: str) -> None:
         self._source_hashes[local_path] = content_hash
@@ -352,7 +379,9 @@ class Orchestration:
 
     # Cache-hit path: carries a hash-unchanged source's previous outputs forward.
     def reuse_previous_outputs(self, local_path: str) -> None:
-        entry = self._previous.sources.get(local_path)
+        if self._previous_manifest is None:
+            return
+        entry = self._previous_manifest.sources.get(local_path)
         if entry is None:
             return
         for output in entry.outputs:
@@ -362,9 +391,9 @@ class Orchestration:
             tui.tick_processed()
             tui.tick_written()
             function_id = self._function_id(output)
-            if function_id in self._previous.load:
+            if function_id in self._previous_manifest.load:
                 self.add_load_function(output)
-            if function_id in self._previous.tick:
+            if function_id in self._previous_manifest.tick:
                 self.add_tick_function(output)
 
     def add_load_function(self, function_output_filepath: str) -> None:
@@ -463,6 +492,14 @@ class Orchestration:
             return frozenset()
         return frozenset(item for item in cast(list[object], value) if isinstance(item, str))
 
+    @staticmethod
+    def _version_pair(value: object) -> tuple[int, int]:
+        if isinstance(value, list):
+            parts = cast(list[object], value)
+            if len(parts) == 2 and all(isinstance(part, int) for part in parts):
+                return (cast(int, parts[0]), cast(int, parts[1]))
+        return (0, 0)
+
     # Convert "data/<namespace>/function/<filepath_remainder>.mcfunction" to "<namespace>:<filepath_remainder>"
     @staticmethod
     def _function_id(filepath: str) -> str:
@@ -470,15 +507,14 @@ class Orchestration:
         return f"{namespace}:{'/'.join(rest).removesuffix('.mcfunction')}"
 
     # Load the previous run's manifest, if any. A missing or corrupt manifest is treated as empty.
-    def _read_manifest(self) -> _Manifest:
-        empty = _Manifest(sources={}, load=frozenset(), tick=frozenset())
+    def _read_manifest(self) -> _Manifest | None:
         try:
             with open(_MANIFEST_FILENAME, encoding="utf-8") as f:
                 raw: object = json.load(f)
         except (OSError, json.JSONDecodeError):
-            return empty
+            return None
         if not isinstance(raw, dict):
-            return empty
+            return None
         raw_dict = cast(dict[str, object], raw)
 
         sources: dict[str, _ManifestSourceEntry] = {}
@@ -495,12 +531,16 @@ class Orchestration:
                     needs_recompile=bool(entry.get("needs_recompile")),
                 )
         return _Manifest(
-            sources=sources, load=self._str_set(raw_dict.get("load")), tick=self._str_set(raw_dict.get("tick"))
+            sources=sources,
+            load=self._str_set(raw_dict.get("load")),
+            tick=self._str_set(raw_dict.get("tick")),
+            version=self._version_pair(raw_dict.get("version")),
         )
 
     # Persist this run's manifest (info on this compile)
     def _write_manifest(self) -> None:
         manifest = {
+            "version": list(_BL_VERSION),
             "load": sorted(self._function_id(output) for output in self._load_functions),
             "tick": sorted(self._function_id(output) for output in self._tick_functions),
             "sources": {
@@ -564,7 +604,7 @@ class Orchestration:
         if not os.path.isdir("data"):
             return
 
-        self._previous = self._read_manifest()
+        self._previous_manifest = self._read_manifest()
 
         discovered: dict[str, str] = {}  # local_path -> namespace
         for namespace in sorted(os.listdir("data")):
@@ -579,9 +619,10 @@ class Orchestration:
                 discovered[local_path] = namespace
 
         # Sources present in the last manifest but not found this run: their outputs are orphaned.
-        if not tui.get_dry_run():
-            for local_path in sorted(set(self._previous.sources) - set(discovered)):
-                for output in self._previous.sources[local_path].outputs:
+        previous_manifest = self._previous_manifest
+        if not tui.get_dry_run() and previous_manifest is not None:
+            for local_path in sorted(set(previous_manifest.sources) - set(discovered)):
+                for output in previous_manifest.sources[local_path].outputs:
                     self.delete_stale_output(output, local_path)
 
         with ThreadPoolExecutor() as executor:
@@ -628,13 +669,18 @@ class Compile:
             return
         tui.tick_processed()
 
-        previous_entry = orchestration.get_previous_entry(self.local_path)
+        previous_entry = orchestration.get_previous_manifest_entry(self.local_path)
         orchestration.record_source(self.local_path, content_hash)
+        previous_compiler_version = orchestration.get_previous_compiler_version()
 
+        # Skip recompile of already-compiled files under circumstances considered safe
         if (
-            previous_entry is not None
-            and content_hash == previous_entry.source_hash
-            and not previous_entry.needs_recompile
+            not _BL_IS_DEV_BUILD
+            and not tui.get_force()
+            and previous_compiler_version
+            and previous_compiler_version == _BL_VERSION
+            and previous_entry is not None
+            and previous_entry.source_hash == content_hash
         ):
             orchestration.reuse_previous_outputs(self.local_path)
             tui.tick_written()
@@ -720,6 +766,13 @@ class Compile:
         if span_start is not None:
             yield lines[span_start:]
 
+    # Convert a minecraft-consumable namespaced function name
+    # "<namespace>:<path/without/extension>" -> "data/<namespace>/function/<path>.mcfunction".
+    @staticmethod
+    def _function_filepath(function_name: str) -> str:
+        namespace, path = function_name.split(":", 1)
+        return f"data/{namespace}/function/{path}.mcfunction"
+
     # Validate a function header and compile its body to an mcfunction file.
     def _compile_function(self, sf: SourceFile, lines: list[_Line]) -> None:
         header = lines[0]
@@ -758,22 +811,29 @@ class Compile:
             return
 
         _data, namespace, _src_root, *subdirs, source_file = sf.local_path.split("/")  # /data/<ns>/blocklight/*/f.bl
-        function_dir = f"data/{namespace}/function"
         if "root" in seen_keywords:
-            output_filepath = f"{function_dir}/{function_name}.mcfunction"
+            function_path = function_name
         else:
-            nested_dir = "/".join([*subdirs, source_file.removesuffix(".bl")])
-            output_filepath = f"{function_dir}/{nested_dir}/{function_name}.mcfunction"
+            function_path = "/".join([*subdirs, source_file.removesuffix(".bl"), function_name])
+        block_in = _BlockInput(sf, function_name, f"{namespace}:{function_path}")
+        output_filepath = self._function_filepath(block_in.function_name)
         tui.tick_discovered()
 
         block_out = _BlockOutput()
         if not tui.get_no_header():
-            block_out.lines.append(f"# {_HEADER_MARKER} {_BL_VERSION} (https://github.com/qcjames53/blocklight)")
+            block_out.lines.append(f"# {_HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)")
             block_out.lines.append(
                 "# Changes saved to this file will not persist. Please modify the source file instead:"
             )
-            block_out.lines.append(f"#     `{sf.local_path}`")
-        self._compile_lines(_BlockInput(sf, function_name), block_out, lines[1:], 1)
+            block_out.lines.append(f"#     `{sf.local_path}:{header.lineno}`")
+        header_line_count = len(block_out.lines)
+        self._compile_lines(block_in, block_out, lines[1:], 1)
+        if block_out.can_return:
+            # A return anywhere below may propagate all the way up to here; start clean so a stale
+            # flag left behind by some earlier, unrelated call chain can't be mistaken for ours.
+            block_out.lines.insert(
+                header_line_count, f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 0"
+            )
         orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
         tui.tick_processed()
 
@@ -782,56 +842,192 @@ class Compile:
         if "tick" in seen_keywords:
             orchestration.add_tick_function(output_filepath)
 
-    # Compile the statements in `lines` at `depth`, appending commands and recording block
-    # properties onto `block_out`.
+    # Compile the top-level commands in `lines` (at `depth`) + recursively compile child blocks
     def _compile_lines(self, block_in: _BlockInput, block_out: _BlockOutput, lines: list[_Line], depth: int) -> None:
+        counts: dict[str, int] = {}
         for span in self._iter_spans(lines, self._single_indent(block_in.sf), depth):
             line = span[0]
             text = line.text.lstrip()  # right is already stripped
             keyword = text.split(maxsplit=1)[0].removesuffix(":")  # 'python:' / 'else:' carry the colon; others don't
+            args = text.partition(" ")[2].removesuffix(":")
+            has_keyword = keyword in _BLOCK_KEYWORDS
             has_body = len(span) > 1
 
-            # Handle block defs
-            if keyword in _BLOCK_KEYWORDS:
-                if not text.endswith(":"):
-                    raise BLSyntaxError(f"'{keyword}' begins a block and must end with ':'.", line)
+            if has_keyword:
                 if not has_body:
                     raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
-                if keyword == "python":
-                    if tui.get_no_python():
-                        raise BLSyntaxError(
-                            "This 'python:' block is not allowed because python blocks are disabled (--no-python).",
+                if not text.endswith(":"):
+                    raise BLSyntaxError(f"'{keyword}' definition must begin a block with ':'.", line)
+                if keyword in _PARAM_REQUIRED_BLOCK_KEYWORDS and args == "":
+                    raise BLSyntaxError(f"'{keyword}' block requires arguments.")
+                if keyword in _NO_PARAM_BLOCK_KEYWORDS and args != "":
+                    raise BLSyntaxError("'{keyword}' block does not take arguments.", line)
+
+                if keyword in _RECURSIVE_BLOCK_KEYWORDS:
+                    tui.tick_discovered()
+                    if keyword in _MODIFIER_BLOCK_KEYWORDS:
+                        # Recursively compile this block into
+                        # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
+                        keyword_count = counts.get(keyword, 0)  # Times this keyword been used in this function
+                        counts[keyword] = keyword_count + 1
+                        child_function_name = f"{block_in.function_name}_helper/{keyword}_{keyword_count}"
+                        new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
+                        new_block_out = _BlockOutput()
+                        self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
+                        tui.tick_processed()
+                        orchestration.write_output_file(
+                            self._function_filepath(child_function_name),
+                            "\n".join(new_block_out.lines),
                             line,
+                            block_in.sf.local_path,
+                            child_function_name.split(":", 1)[0],
                         )
-                    if text != "python:":
-                        raise BLSyntaxError("A 'python:' block header takes no arguments.", line)
-                    orchestration.mark_needs_recompile(block_in.sf.local_path)  # non-deterministic: always recompile
-                    self._compile_lines(block_in, block_out, self._run_python_block(block_in, span, depth), depth)
+
+                        # Determine what framework needs to be constructed around the child function call
+                        macros_string = self._macros_with_clause(new_block_out.macros)  # Were macros used?
+                        if new_block_out.can_return:  # Could the child function run a return command?
+                            block_out.can_return = True
+                            self._append_line_to_block_out(
+                                block_out,
+                                _Line(
+                                    f"execute {keyword} {args} "
+                                    f"store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} "
+                                    f"store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} "
+                                    f"run function {child_function_name}{macros_string}",
+                                    line.lineno,
+                                ),
+                            )
+                            self._append_line_to_block_out(
+                                block_out,
+                                _Line(
+                                    f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                                    f"if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                                    f"run return run scoreboard players get "
+                                    f"{_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}",
+                                    line.lineno,
+                                ),
+                            )
+                            self._append_line_to_block_out(
+                                block_out,
+                                _Line(
+                                    f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                                    f"if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 "
+                                    f"run return fail",
+                                    line.lineno,
+                                ),
+                            )
+                        else:
+                            self._append_line_to_block_out(
+                                block_out,
+                                _Line(
+                                    f"execute {keyword} {args} run function {child_function_name}{macros_string}",
+                                    line.lineno,
+                                ),
+                            )
+                    else:
+                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+                elif keyword in _INLINE_BLOCK_KEYWORDS:
+                    if keyword == "python":
+                        # Execute python (if permitted) and run emitted lines through this method recursively
+                        emitted = self._handle_python_block(block_in, span, depth)
+                        self._compile_lines(block_in, block_out, emitted, depth)
+                    else:
+                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
                 else:
-                    # TODO create block handling here
                     raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+
+            # Handle regular commands with body
             elif has_body:
                 raise BLSyntaxError("Only block keywords may begin an indented block.", span[1])
 
+            # Handle inline return commands
+            elif text.startswith("execute ") and text.find(" run return ") != -1:
+                # Create a child helper file to call the inline return
+                split_result = text.split(" run return ")
+                if len(split_result) != 2:
+                    raise BLSyntaxError("This 'execute' statement contains a malformed 'return' command.")
+                execute_command, return_command_tail = split_result
+                return_count = counts.get("return", 0)
+                counts["return"] = return_count + 1
+                child_filepath = f"{block_in.function_name}_helper/return_{return_count}"
+                child_block_out = _BlockOutput()
+                self._append_line_to_block_out(
+                    child_block_out,
+                    _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno),
+                )
+                self._append_line_to_block_out(child_block_out, _Line(f"return {return_command_tail}", line.lineno))
+                orchestration.write_output_file(
+                    self._function_filepath(child_filepath),
+                    "\n".join(child_block_out.lines),
+                    line,
+                    block_in.sf.local_path,
+                    child_filepath.split(":", 1)[0],
+                )
+
+                # Build framework around original execute command
+                block_out.can_return = True
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(
+                        f"{execute_command} store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} "
+                        f"store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} "
+                        f"run function {child_filepath}{self._macros_with_clause(child_block_out.macros)}",
+                        line.lineno,
+                    ),
+                )
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(
+                        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                        f"if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                        f"run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}",
+                        line.lineno,
+                    ),
+                )
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(
+                        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                        f"if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 "
+                        f"run return fail",
+                        line.lineno,
+                    ),
+                )
+
+            # Handle regular return commands
+            elif text.startswith("return "):
+                block_out.can_return = True
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno),
+                )
+                self._append_line_to_block_out(block_out, line)
+
             # Handle regular commands
             else:
-                text = line.text.lstrip()  # right side already stripped
-                if not block_out.can_return:  # cheap early-return detection; occasional false positives are acceptable
-                    loc = text.find("return")
-                    word_start = loc == 0 or text[loc - 1] == " "
-                    word_end = len(text) <= loc + 6 or text[loc + 6] == " "
-                    if loc != -1 and word_start and word_end:
-                        block_out.can_return = True
+                self._append_line_to_block_out(block_out, line)
 
-                has_macro_dollar = text.startswith("$")
-                uses_macro = False
-                if "$(" in text:
-                    for macro_name in Compile._iter_macro_names(line):
-                        block_out.macros.add(macro_name)
-                        uses_macro = True
-                if not uses_macro and has_macro_dollar:
-                    raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
-                block_out.lines.append("$" + text if uses_macro and not has_macro_dollar else text)
+    @staticmethod
+    def _append_line_to_block_out(block_out: _BlockOutput, line: _Line) -> None:
+        text = line.text.lstrip()
+        has_macro_dollar = text.startswith("$")
+        uses_macros = False
+        if "$(" in text:
+            for macro_name in Compile._iter_macro_names(line):
+                block_out.macros.add(macro_name)
+                uses_macros = True
+        if has_macro_dollar and not uses_macros:
+            raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
+        block_out.lines.append("$" + text if not has_macro_dollar and uses_macros else text)
+
+    # Build a vanilla `with {...}` clause forwarding each of `macros` from the current function's
+    # own macro arguments into the function being called.
+    @staticmethod
+    def _macros_with_clause(macros: set[str]) -> str:
+        if not macros:
+            return ""
+        macro_args = ", ".join(f'"{m}": "$({m})"' for m in sorted(macros))
+        return f" with {{{macro_args}}}"
 
     # Yield the name inside each vanilla macro '$(name)' in line, left to right.
     @staticmethod
@@ -851,11 +1047,14 @@ class Compile:
 
     # Execute a python: block and return the lines it emits re-indented to `depth` and anchored at the block header.
     @staticmethod
-    def _run_python_block(block_in: _BlockInput, span: list[_Line], depth: int) -> list[_Line]:
+    def _handle_python_block(block_in: _BlockInput, span: list[_Line], depth: int) -> list[_Line]:
         sf = block_in.sf
         head = span[0]
         body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
 
+        if tui.get_no_python():
+            raise BLSyntaxError("This Python blocks is disabled due to your compile parameters.", head)
+        orchestration.mark_needs_recompile(sf.local_path)
         emitted: list[str] = []
 
         def emit(command: object) -> None:
@@ -881,7 +1080,7 @@ class Compile:
 def main() -> None:
     if sys.version_info < _MIN_PYTHON:
         required = ".".join(str(part) for part in _MIN_PYTHON)
-        raise SystemExit(f"Blocklight {_BL_VERSION} requires Python {required} or newer.")
+        raise SystemExit(f"Blocklight {_BL_VERSION_STRING} requires Python {required} or newer.")
 
     tui.parse_args()
     tui.start()
@@ -889,8 +1088,8 @@ def main() -> None:
     tui.finish()
 
 
-tui = TUI()
-orchestration = Orchestration()
+tui: TUI = TUI()
+orchestration: Orchestration = Orchestration()
 
 
 # Replaces both globals with fresh instances. Mainly for test isolation between compile runs.

@@ -80,7 +80,8 @@ function locators_example:
         emit(f"say Datapack format: '{bl.PACK_FORMAT}'")
         emit(f"say Namespace: '{bl.NAMESPACE}'")
         emit(f"say Source file: '{bl.FILE}'")
-        emit(f"say Function name: '{bl.FUNCTION}'")
+        emit(f"say Function name: '{bl.FUNCTION_NAME}'")
+        emit(f"say Output function name: '{bl.OUTPUT_FUNCTION_NAME}'")
         emit(f"say Blocklight version: '{bl.BLOCKLIGHT_VERSION}'")
 """)
     assert out.errors == []
@@ -92,7 +93,8 @@ function locators_example:
             "say Namespace: 'bl_example'",
             "say Source file: 'python.bl'",
             "say Function name: 'locators_example'",
-            f"say Blocklight version: '{blocklight._BL_VERSION}'",
+            "say Output function name: 'bl_example:python/locators_example'",
+            f"say Blocklight version: '{blocklight._BL_VERSION_STRING}'",
         ]
     )
     assert out.file_contents == {"data/bl_example/function/python/locators_example.mcfunction": expected}
@@ -146,18 +148,18 @@ function silent:
 
 def test_emitted_output_is_recompiled_as_blocklight_source():
     # An emit()ed line that looks like a block keyword is routed back through the compiler, not
-    # passed through verbatim. `as` blocks aren't implemented yet, so this surfaces that error
-    # rather than writing a bogus "as @s:" command line.
+    # passed through verbatim. `if` blocks aren't implemented yet, so this surfaces that error
+    # rather than writing a bogus "if condition:" command line.
     out = _compile("""\
 function foo:
     python:
-        emit("as @s:")
+        emit("if condition:")
         emit("    say hi")
     say bye
 """)
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
-    assert "'as' block is not yet implemented" in str(out.errors[0])
+    assert "'if' block is not yet implemented" in str(out.errors[0])
     assert out.file_contents == {}
 
 
@@ -175,5 +177,5 @@ function plain:
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
     assert out.errors[0].lineno == 2  # points at the python: header
-    assert "--no-python" in str(out.errors[0])
+    assert "disabled due to your compile parameters" in str(out.errors[0])
     assert out.file_contents == {"data/bl_example/function/python/plain.mcfunction": "say ok"}
