@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Blocklight - A blazing fast mcfunction microcompiler"""
 
 import argparse
@@ -15,20 +16,24 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import NamedTuple, cast
 
+# Tweakable constants
 _BL_VERSION = (1, 0)
 _BL_IS_DEV_BUILD = True
-_BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
+_FILE_WRITE_WORKERS_COUNT = 8
 
+_BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
 _MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")
 _FUNCTION_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))
 _MODIFIER_BLOCK_KEYWORDS = frozenset(
     ("align", "anchored", "as", "at", "facing", "in", "on", "positioned", "rotated", "summon")
 )
-_CONDITION_BLOCK_KEYWORDS = frozenset(("if", "elif", "else", "while"))
-_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | _CONDITION_BLOCK_KEYWORDS | {"python"}
-_FILE_WRITE_WORKERS_COUNT = 8
+_RECURSIVE_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "else", "while"))
+_INLINE_BLOCK_KEYWORDS = frozenset("python")
+_BLOCK_KEYWORDS = _RECURSIVE_BLOCK_KEYWORDS | _INLINE_BLOCK_KEYWORDS
+_NO_PARAM_BLOCK_KEYWORDS = frozenset(("python","else"))
+_PARAM_REQUIRED_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "while"))
 _MANIFEST_FILENAME = ".blocklight-manifest.json"
 _HEADER_MARKER = "Compiled by Blocklight"
 
@@ -837,29 +842,21 @@ class Compile:
             has_keyword = keyword in _BLOCK_KEYWORDS
             has_body = len(span) > 1
 
-            # Handle block commands without body
-            if has_keyword and not has_body:
-                raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
-
-            # Handle block commands
-            elif has_keyword:
+            if has_keyword:
+                if not has_body:
+                    raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
                 if not text.endswith(":"):
-                    raise BLSyntaxError(f"'{keyword}' begins a block and must end with ':'.", line)
+                    raise BLSyntaxError(f"'{keyword}' definition must begin a block with ':'.", line)
+                if keyword in _PARAM_REQUIRED_BLOCK_KEYWORDS and args == "":
+                    raise BLSyntaxError(f"'{keyword}' block requires arguments.")
+                if keyword in _NO_PARAM_BLOCK_KEYWORDS and args != "":
+                    raise BLSyntaxError("'{keyword}' block does not take arguments.", line)
 
-                match keyword:
-                    case "python":
-                        if args != "":
-                            raise BLSyntaxError("'python:' blocks do not take arguments.", line)
-                        # Execute python (if permitted) and run emitted lines through this method recursively
-                        emitted = self._handle_python_block(block_in, span, depth)
-                        self._compile_lines(block_in, block_out, emitted, depth)
-
-                    case _ if keyword in _MODIFIER_BLOCK_KEYWORDS:
-                        if args == "":
-                            raise BLSyntaxError(f"'{keyword}' blocks require arguments.")
+                if keyword in _RECURSIVE_BLOCK_KEYWORDS:
+                    tui.tick_discovered()
+                    if keyword in _MODIFIER_BLOCK_KEYWORDS:
                         # Recursively compile this block into
                         # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
-                        tui.tick_discovered()
                         keyword_count = counts.get(keyword, 0)
                         counts[keyword] = keyword_count + 1
                         child_function_name = f"{block_in.function_name}_helper/{keyword}_{keyword_count}"
@@ -884,10 +881,21 @@ class Compile:
                             macros_string = f" with {{{macro_args}}}"
 
                         # Call the recursive block from this function
-                        # TODO - respect returns and macros
+                        # TODO - respect returns
                         modifier_command = f"execute {keyword} {args} run function {child_function_name}{macros_string}"
                         self._append_line_to_block_out(block_out, _Line(modifier_command, line.lineno))
-                    case _:
+                    elif keyword == "if":
+                        pass
+                    else:
+                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+                elif keyword in _INLINE_BLOCK_KEYWORDS:
+                    if keyword == "python":
+                        # Execute python (if permitted) and run emitted lines through this method recursively
+                        emitted = self._handle_python_block(block_in, span, depth)
+                        self._compile_lines(block_in, block_out, emitted, depth)
+                    else:
+                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+                else:
                         raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
 
             # Handle regular commands with body

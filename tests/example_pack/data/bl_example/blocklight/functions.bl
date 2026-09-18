@@ -25,3 +25,11 @@ tick function hello_tick:
 # You can combine function keywords in any order:
 root load tick function hello_universe:
     say Hello, universe!
+
+
+# Return commands terminate the function, regardless of how deeply nested they are.
+function complete_return:
+    as @p:
+        at @s:
+            return 42
+    say This will never run.
