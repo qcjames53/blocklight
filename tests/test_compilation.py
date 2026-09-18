@@ -61,7 +61,7 @@ function hello:
         [
             f"# Compiled by Blocklight {blocklight._BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)",
             "# Changes saved to this file will not persist. Please modify the source file instead:",
-            "#     `data/hello_world/blocklight/main.bl`",
+            "#     `data/hello_world/blocklight/main.bl:1`",
             "say Hello, world!",
         ]
     )

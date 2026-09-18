@@ -30,12 +30,16 @@ _MODIFIER_BLOCK_KEYWORDS = frozenset(
     ("align", "anchored", "as", "at", "facing", "in", "on", "positioned", "rotated", "summon")
 )
 _RECURSIVE_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "else", "while"))
-_INLINE_BLOCK_KEYWORDS = frozenset("python")
+_INLINE_BLOCK_KEYWORDS = frozenset(("python",))
 _BLOCK_KEYWORDS = _RECURSIVE_BLOCK_KEYWORDS | _INLINE_BLOCK_KEYWORDS
 _NO_PARAM_BLOCK_KEYWORDS = frozenset(("python","else"))
 _PARAM_REQUIRED_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "while"))
 _MANIFEST_FILENAME = ".blocklight-manifest.json"
 _HEADER_MARKER = "Compiled by Blocklight"
+_BL_RESERVED_SCOREBOARD = "_bl"
+_BL_RETURNING_HOLDER = "#_bl_returning"
+_BL_SUCCESS_HOLDER = "#_bl_success"
+_BL_VALUE_HOLDER = "#_bl_value"
 
 
 # One line in source tracking original line number
@@ -821,8 +825,15 @@ class Compile:
             block_out.lines.append(
                 "# Changes saved to this file will not persist. Please modify the source file instead:"
             )
-            block_out.lines.append(f"#     `{sf.local_path}`")
+            block_out.lines.append(f"#     `{sf.local_path}:{header.lineno}`")
+        header_line_count = len(block_out.lines)
         self._compile_lines(block_in, block_out, lines[1:], 1)
+        if block_out.can_return:
+            # A return anywhere below may propagate all the way up to here; start clean so a stale
+            # flag left behind by some earlier, unrelated call chain can't be mistaken for ours.
+            block_out.lines.insert(
+                header_line_count, f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 0"
+            )
         orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
         tui.tick_processed()
 
@@ -857,15 +868,13 @@ class Compile:
                     if keyword in _MODIFIER_BLOCK_KEYWORDS:
                         # Recursively compile this block into
                         # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
-                        keyword_count = counts.get(keyword, 0)
+                        keyword_count = counts.get(keyword, 0) # Times this keyword been used in this function
                         counts[keyword] = keyword_count + 1
                         child_function_name = f"{block_in.function_name}_helper/{keyword}_{keyword_count}"
-
                         new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
                         new_block_out = _BlockOutput()
                         self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
                         tui.tick_processed()
-
                         orchestration.write_output_file(
                             self._function_filepath(child_function_name),
                             "\n".join(new_block_out.lines),
@@ -874,18 +883,15 @@ class Compile:
                             child_function_name.split(":", 1)[0],
                         )
 
-                        # Detemine what macros were used (if any)
-                        macros_string = ""
-                        if len(new_block_out.macros) >= 1:
-                            macro_args = ", ".join(f'"{m}": "$({m})"' for m in sorted(new_block_out.macros))
-                            macros_string = f" with {{{macro_args}}}"
-
-                        # Call the recursive block from this function
-                        # TODO - respect returns
-                        modifier_command = f"execute {keyword} {args} run function {child_function_name}{macros_string}"
-                        self._append_line_to_block_out(block_out, _Line(modifier_command, line.lineno))
-                    elif keyword == "if":
-                        pass
+                        # Determine what framework needs to be constructed around the child function call
+                        macros_string = self._macros_with_clause(new_block_out.macros)  # Were macros used?
+                        if new_block_out.can_return:  # Could the child function run a return command?
+                            block_out.can_return = True
+                            self._append_line_to_block_out(block_out, _Line(f"execute {keyword} {args} store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run function {child_function_name}{macros_string}", line.lineno))  # noqa: E501
+                            self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}", line.lineno))  # noqa: E501
+                            self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail", line.lineno))  # noqa: E501
+                        else:
+                            self._append_line_to_block_out(block_out, _Line(f"execute {keyword} {args} run function {child_function_name}{macros_string}", line.lineno))  # noqa: E501
                     else:
                         raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
                 elif keyword in _INLINE_BLOCK_KEYWORDS:
@@ -902,6 +908,39 @@ class Compile:
             elif has_body:
                 raise BLSyntaxError("Only block keywords may begin an indented block.", span[1])
 
+            # Handle inline return commands
+            elif text.startswith("execute ") and text.find(" run return ") != -1:
+                # Create a child helper file to call the inline return
+                split_result = text.split(" run return ")
+                if len(split_result) != 2:
+                    raise BLSyntaxError("This 'execute' statement contains a malformed 'return' command.")
+                execute_command, return_command_tail = split_result
+                return_count = counts.get("return", 0)
+                counts["return"] = return_count + 1
+                child_filepath = f"{block_in.function_name}_helper/return_{return_count}"
+                child_block_out = _BlockOutput()
+                self._append_line_to_block_out(child_block_out, _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno))  # noqa: E501
+                self._append_line_to_block_out(child_block_out, _Line(f"return {return_command_tail}", line.lineno))
+                orchestration.write_output_file(
+                    self._function_filepath(child_filepath),
+                    "\n".join(child_block_out.lines),
+                    line,
+                    block_in.sf.local_path,
+                    child_filepath.split(":", 1)[0],
+                )
+
+                # Build framework around original execute command
+                block_out.can_return = True
+                self._append_line_to_block_out(block_out, _Line(f"{execute_command} store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run function {child_filepath}{self._macros_with_clause(child_block_out.macros)}", line.lineno))  # noqa: E501
+                self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}", line.lineno))  # noqa: E501
+                self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail", line.lineno))  # noqa: E501
+
+            # Handle regular return commands
+            elif text.startswith("return "):
+                block_out.can_return = True
+                self._append_line_to_block_out(block_out, _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno))  # noqa: E501
+                self._append_line_to_block_out(block_out, line)
+
             # Handle regular commands
             else:
                 self._append_line_to_block_out(block_out, line)
@@ -909,15 +948,6 @@ class Compile:
     @staticmethod
     def _append_line_to_block_out(block_out: _BlockOutput, line: _Line) -> None:
         text = line.text.lstrip()
-        # Detect if maybe this line contains a return command. False positives are acceptable.
-        if not block_out.can_return:
-            return_string_location = text.find("return")
-            if (
-                return_string_location != -1 and
-                (return_string_location == 0 or text[return_string_location - 1] == " ") and  # Start okay
-                (len(text) <= return_string_location + 6 or text[return_string_location + 6] == " ")  # End okay
-            ):
-                block_out.can_return = True
         has_macro_dollar = text.startswith("$")
         uses_macros = False
         if "$(" in text:
@@ -928,6 +958,14 @@ class Compile:
             raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
         block_out.lines.append("$" + text if not has_macro_dollar and uses_macros else text)
 
+    # Build a vanilla `with {...}` clause forwarding each of `macros` from the current function's
+    # own macro arguments into the function being called.
+    @staticmethod
+    def _macros_with_clause(macros: set[str]) -> str:
+        if not macros:
+            return ""
+        macro_args = ", ".join(f'"{m}": "$({m})"' for m in sorted(macros))
+        return f" with {{{macro_args}}}"
 
     # Yield the name inside each vanilla macro '$(name)' in line, left to right.
     @staticmethod

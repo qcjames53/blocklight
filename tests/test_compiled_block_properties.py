@@ -2,7 +2,7 @@
 # pyright: reportPrivateUsage=false
 
 import blocklight
-from tests.helpers import NO_HEADER, build_lines, compile_source, reset_for_test
+from tests.helpers import NO_HEADER, build_lines, compile_source, reset_for_test, stub_disk_writes
 
 
 def _props(source: str) -> blocklight._BlockOutput:
@@ -11,7 +11,9 @@ def _props(source: str) -> blocklight._BlockOutput:
     sf = blocklight.SourceFile(local_path="data/pack/blocklight/main.bl", source_lines=build_lines(source))
     block_out = blocklight._BlockOutput()
     compile_ = blocklight.Compile("data/pack/blocklight/main.bl", "pack")
-    compile_._compile_lines(blocklight._BlockInput(sf, "f", "pack:f"), block_out, sf.source_lines[1:], 1)
+    with stub_disk_writes():
+        compile_._compile_lines(blocklight._BlockInput(sf, "f", "pack:f"), block_out, sf.source_lines[1:], 1)
+        blocklight.orchestration.wait_for_writes()
     return block_out
 
 
@@ -127,10 +129,12 @@ function meaning_of_life:
     assert props.can_return is True
 
 
-def test_can_return_true_for_bare_return_at_end_of_line():
+def test_can_return_true_for_return_embedded_in_an_execute_chain():
+    # Bare `return` with no argument isn't valid vanilla syntax (verified in-game) -- the three
+    # real forms (`return <value>`, `return fail`, `return run <command>`) all take an argument.
     props = _props("""\
 function f:
-    execute if score #x tmp matches 1 run return
+    execute if score #x tmp matches 1 run return fail
 """)
     assert props.can_return is True
 
