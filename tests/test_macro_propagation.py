@@ -41,7 +41,7 @@ function f:
 """)
     assert out.errors == []
     assert out.file_contents["data/pack/function/main/f.mcfunction"] == (
-        '$execute as @p run function pack:main/f_helper/as_0 '
+        "$execute as @p run function pack:main/f_helper/as_0 "
         'with {"alpha": "$(alpha)", "mid": "$(mid)", "zeta": "$(zeta)"}'
     )
 
@@ -76,7 +76,7 @@ function f:
             '$execute at @s run function pack:main/f_helper/as_0_helper/at_0 with {"a": "$(a)"}'
         ),
         "data/pack/function/main/f_helper/as_0_helper/at_0.mcfunction": (
-            '$execute positioned ~ ~ ~ run function '
+            "$execute positioned ~ ~ ~ run function "
             'pack:main/f_helper/as_0_helper/at_0_helper/positioned_0 with {"a": "$(a)"}'
         ),
         "data/pack/function/main/f_helper/as_0_helper/at_0_helper/positioned_0.mcfunction": "$say $(a) hi",
@@ -206,7 +206,7 @@ function f:
 """)
     assert out.errors == []
     assert out.file_contents["data/pack/function/main/f.mcfunction"].splitlines()[1] == (
-        '$execute if entity @s store result score #_bl_value _bl store success score #_bl_success _bl '
+        "$execute if entity @s store result score #_bl_value _bl store success score #_bl_success _bl "
         'run function pack:main/f_helper/return_0 with {"v": "$(v)"}'
     )
     assert out.file_contents["data/pack/function/main/f_helper/return_0.mcfunction"] == "\n".join(
@@ -251,7 +251,7 @@ function f:
     assert out.errors == []
     top = out.file_contents["data/pack/function/main/f.mcfunction"]
     assert top.splitlines()[1] == (
-        '$execute as @p store result score #_bl_value _bl store success score #_bl_success _bl '
+        "$execute as @p store result score #_bl_value _bl store success score #_bl_success _bl "
         'run function pack:main/f_helper/as_0 with {"x": "$(x)"}'
     )
     assert out.file_contents["data/pack/function/main/f_helper/as_0.mcfunction"] == "\n".join(

@@ -14,9 +14,7 @@ CHECK_FAIL = "execute if score #_bl_returning _bl matches 1 if score #_bl_succes
 
 
 def _stores(prefix: str, target: str) -> str:
-    return (
-        f"{prefix} store result score #_bl_value _bl store success score #_bl_success _bl run function {target}"
-    )
+    return f"{prefix} store result score #_bl_value _bl store success score #_bl_success _bl run function {target}"
 
 
 def test_no_return_in_tree_is_unchanged_from_before_the_feature():
@@ -262,7 +260,7 @@ function f:
     )
     top = out.file_contents["data/pack/function/main/f.mcfunction"]
     assert top.splitlines()[1] == (
-        '$execute if entity @s store result score #_bl_value _bl store success score #_bl_success _bl '
+        "$execute if entity @s store result score #_bl_value _bl store success score #_bl_success _bl "
         'run function pack:main/f_helper/return_0 with {"v": "$(v)"}'
     )
 
@@ -297,9 +295,7 @@ function f:
     execute run tellraw @a {"text":"return"}
 """)
     assert out.errors == []
-    assert out.file_contents == {
-        "data/pack/function/main/f.mcfunction": 'execute run tellraw @a {"text":"return"}'
-    }
+    assert out.file_contents == {"data/pack/function/main/f.mcfunction": 'execute run tellraw @a {"text":"return"}'}
 
 
 def test_reset_line_is_inserted_after_the_header_comment_block():

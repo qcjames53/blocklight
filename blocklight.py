@@ -32,7 +32,7 @@ _MODIFIER_BLOCK_KEYWORDS = frozenset(
 _RECURSIVE_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "else", "while"))
 _INLINE_BLOCK_KEYWORDS = frozenset(("python",))
 _BLOCK_KEYWORDS = _RECURSIVE_BLOCK_KEYWORDS | _INLINE_BLOCK_KEYWORDS
-_NO_PARAM_BLOCK_KEYWORDS = frozenset(("python","else"))
+_NO_PARAM_BLOCK_KEYWORDS = frozenset(("python", "else"))
 _PARAM_REQUIRED_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "while"))
 _MANIFEST_FILENAME = ".blocklight-manifest.json"
 _HEADER_MARKER = "Compiled by Blocklight"
@@ -675,10 +675,12 @@ class Compile:
 
         # Skip recompile of already-compiled files under circumstances considered safe
         if (
-            not _BL_IS_DEV_BUILD and
-            not tui.get_force() and
-            previous_compiler_version and previous_compiler_version == _BL_VERSION and
-            previous_entry is not None and previous_entry.source_hash == content_hash
+            not _BL_IS_DEV_BUILD
+            and not tui.get_force()
+            and previous_compiler_version
+            and previous_compiler_version == _BL_VERSION
+            and previous_entry is not None
+            and previous_entry.source_hash == content_hash
         ):
             orchestration.reuse_previous_outputs(self.local_path)
             tui.tick_written()
@@ -819,9 +821,7 @@ class Compile:
 
         block_out = _BlockOutput()
         if not tui.get_no_header():
-            block_out.lines.append(
-                f"# {_HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)"
-            )
+            block_out.lines.append(f"# {_HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)")
             block_out.lines.append(
                 "# Changes saved to this file will not persist. Please modify the source file instead:"
             )
@@ -868,7 +868,7 @@ class Compile:
                     if keyword in _MODIFIER_BLOCK_KEYWORDS:
                         # Recursively compile this block into
                         # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
-                        keyword_count = counts.get(keyword, 0) # Times this keyword been used in this function
+                        keyword_count = counts.get(keyword, 0)  # Times this keyword been used in this function
                         counts[keyword] = keyword_count + 1
                         child_function_name = f"{block_in.function_name}_helper/{keyword}_{keyword_count}"
                         new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
@@ -887,11 +887,43 @@ class Compile:
                         macros_string = self._macros_with_clause(new_block_out.macros)  # Were macros used?
                         if new_block_out.can_return:  # Could the child function run a return command?
                             block_out.can_return = True
-                            self._append_line_to_block_out(block_out, _Line(f"execute {keyword} {args} store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run function {child_function_name}{macros_string}", line.lineno))  # noqa: E501
-                            self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}", line.lineno))  # noqa: E501
-                            self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail", line.lineno))  # noqa: E501
+                            self._append_line_to_block_out(
+                                block_out,
+                                _Line(
+                                    f"execute {keyword} {args} "
+                                    f"store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} "
+                                    f"store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} "
+                                    f"run function {child_function_name}{macros_string}",
+                                    line.lineno,
+                                ),
+                            )
+                            self._append_line_to_block_out(
+                                block_out,
+                                _Line(
+                                    f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                                    f"if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                                    f"run return run scoreboard players get "
+                                    f"{_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}",
+                                    line.lineno,
+                                ),
+                            )
+                            self._append_line_to_block_out(
+                                block_out,
+                                _Line(
+                                    f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                                    f"if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 "
+                                    f"run return fail",
+                                    line.lineno,
+                                ),
+                            )
                         else:
-                            self._append_line_to_block_out(block_out, _Line(f"execute {keyword} {args} run function {child_function_name}{macros_string}", line.lineno))  # noqa: E501
+                            self._append_line_to_block_out(
+                                block_out,
+                                _Line(
+                                    f"execute {keyword} {args} run function {child_function_name}{macros_string}",
+                                    line.lineno,
+                                ),
+                            )
                     else:
                         raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
                 elif keyword in _INLINE_BLOCK_KEYWORDS:
@@ -902,7 +934,7 @@ class Compile:
                     else:
                         raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
                 else:
-                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+                    raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
 
             # Handle regular commands with body
             elif has_body:
@@ -919,7 +951,10 @@ class Compile:
                 counts["return"] = return_count + 1
                 child_filepath = f"{block_in.function_name}_helper/return_{return_count}"
                 child_block_out = _BlockOutput()
-                self._append_line_to_block_out(child_block_out, _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno))  # noqa: E501
+                self._append_line_to_block_out(
+                    child_block_out,
+                    _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno),
+                )
                 self._append_line_to_block_out(child_block_out, _Line(f"return {return_command_tail}", line.lineno))
                 orchestration.write_output_file(
                     self._function_filepath(child_filepath),
@@ -931,14 +966,41 @@ class Compile:
 
                 # Build framework around original execute command
                 block_out.can_return = True
-                self._append_line_to_block_out(block_out, _Line(f"{execute_command} store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run function {child_filepath}{self._macros_with_clause(child_block_out.macros)}", line.lineno))  # noqa: E501
-                self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}", line.lineno))  # noqa: E501
-                self._append_line_to_block_out(block_out, _Line(f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail", line.lineno))  # noqa: E501
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(
+                        f"{execute_command} store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} "
+                        f"store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} "
+                        f"run function {child_filepath}{self._macros_with_clause(child_block_out.macros)}",
+                        line.lineno,
+                    ),
+                )
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(
+                        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                        f"if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                        f"run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}",
+                        line.lineno,
+                    ),
+                )
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(
+                        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 "
+                        f"if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 "
+                        f"run return fail",
+                        line.lineno,
+                    ),
+                )
 
             # Handle regular return commands
             elif text.startswith("return "):
                 block_out.can_return = True
-                self._append_line_to_block_out(block_out, _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno))  # noqa: E501
+                self._append_line_to_block_out(
+                    block_out,
+                    _Line(f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1", line.lineno),
+                )
                 self._append_line_to_block_out(block_out, line)
 
             # Handle regular commands

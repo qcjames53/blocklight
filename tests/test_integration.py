@@ -44,11 +44,10 @@ _EXPECTED_FILE_CONTENTS = {
         '$function bl_example:macros/macros_demo_b with {"a": "$(a)"}'
     ),
     "data/bl_example/function/macros/macros_demo_a_helper/as_0.mcfunction": (
-        '$execute at @s run function bl_example:macros/macros_demo_a_helper/as_0_helper/at_0 '
-        'with {"a": "$(a)"}'
+        '$execute at @s run function bl_example:macros/macros_demo_a_helper/as_0_helper/at_0 with {"a": "$(a)"}'
     ),
     "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0.mcfunction": (
-        '$execute positioned ~ ~ ~ run function '
+        "$execute positioned ~ ~ ~ run function "
         'bl_example:macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0 with {"a": "$(a)"}'
     ),
     "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0.mcfunction": (
