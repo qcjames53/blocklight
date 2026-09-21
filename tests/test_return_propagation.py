@@ -366,3 +366,83 @@ function f
     for level in (as_0, at_0):
         assert RELAY_CHECK in level
     assert positioned_0 == "\n".join(_leaf("5"))
+
+
+# --- Interaction with if/elif/else chains ------------------------------------------------------
+
+
+def test_bare_if_return_propagates_like_a_modifier_block():
+    out = compile_source("""\
+function f
+    if score @a v matches 1
+        return 1
+""")
+    assert out.errors == []
+    assert out.file_contents == {
+        "data/pack/function/main/f.mcfunction": "\n".join(
+            [RESET, _call("execute if score @a v matches 1", "pack:main/f_helper/chain_0_if"), CHECK_OK, CHECK_FAIL]
+        ),
+        "data/pack/function/main/f_helper/chain_0_if.mcfunction": "\n".join(_leaf("1")),
+    }
+
+
+def test_if_else_chain_return_propagates_through_the_dispatcher_by_the_holder_scoreboards_alone():
+    # The call into the dispatcher is a plain, unwrapped `function <dispatcher>` -- exactly like a
+    # modifier's own child call -- because the branch that actually returns already set the
+    # holder scoreboards itself; the dispatcher's own `return run` chaining only short-circuits
+    # its sibling conditions and is never relied on to carry the value back out.
+    out = compile_source("""\
+function f
+    if score @a v matches 1
+        return 1
+    else
+        return 2
+""")
+    assert out.errors == []
+    assert out.file_contents == {
+        "data/pack/function/main/f.mcfunction": "\n".join(
+            [RESET, "function pack:main/f_helper/chain_0", CHECK_OK, CHECK_FAIL]
+        ),
+        "data/pack/function/main/f_helper/chain_0.mcfunction": "\n".join(
+            [
+                "execute if score @a v matches 1 run return run function pack:main/f_helper/chain_0_if",
+                "return run function pack:main/f_helper/chain_0_else",
+            ]
+        ),
+        "data/pack/function/main/f_helper/chain_0_if.mcfunction": "\n".join(_leaf("1")),
+        "data/pack/function/main/f_helper/chain_0_else.mcfunction": "\n".join(_leaf("2")),
+    }
+
+
+def test_if_chain_return_nested_inside_a_modifier_only_relays():
+    out = compile_source("""\
+function f
+    as @p
+        if score @a v matches 1
+            return 1
+        else
+            return 2
+""")
+    assert out.errors == []
+    top = out.file_contents["data/pack/function/main/f.mcfunction"]
+    as_0 = out.file_contents["data/pack/function/main/f_helper/as_0.mcfunction"]
+    assert top.startswith(RESET)
+    assert CHECK_OK in top
+    assert CHECK_FAIL in top
+    assert RELAY_CHECK in as_0
+    assert CHECK_OK not in as_0
+    assert CHECK_FAIL not in as_0
+
+
+def test_if_chain_with_no_return_gets_no_reset_line():
+    out = compile_source("""\
+function f
+    if score @a v matches 1
+        say a
+    else
+        say b
+""")
+    assert out.errors == []
+    top = out.file_contents["data/pack/function/main/f.mcfunction"]
+    assert not top.startswith(RESET)
+    assert RESET not in top

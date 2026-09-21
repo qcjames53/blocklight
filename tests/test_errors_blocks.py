@@ -16,10 +16,10 @@ function hello
     assert out.file_contents == {}
 
 
-def test_condition_block_not_yet_implemented():
+def test_while_block_not_yet_implemented():
     out = compile_source("""\
 function hello
-    if @s
+    while @s
         say hi
 """)
     assert len(out.errors) == 1

@@ -2,8 +2,8 @@
 # place. Output is left on disk (see .gitignore) for inspection after a test run, but the test
 # deletes any such leftovers from a prior run before compiling, so it stays idempotent even though
 # manifest-driven caching would otherwise skip rewriting unchanged output (see test_manifest.py).
-# Two functions use not-yet-implemented block keywords and are expected to fail and be reported
-# on stderr.
+# Two functions use not-yet-implemented block keywords/features and are expected to fail and be
+# reported on stderr.
 
 import shutil
 import subprocess
@@ -68,7 +68,8 @@ _EXPECTED_FILE_CONTENTS = {
     ),
 }
 
-# Functions using not-yet-implemented block keywords (while/if) must not compile.
+# Functions using not-yet-implemented block keywords/features (`while`; boolean composition in
+# `if` conditions) must not compile.
 _EXPECTED_MISSING_FILES = {
     "data/bl_example/function/fizzbuzz/fizzbuzz.mcfunction",
     "data/bl_example/function/binary_search/ocean_floor_height.mcfunction",
@@ -77,7 +78,7 @@ _EXPECTED_MISSING_FILES = {
 # (source basename, line) for the two expected recoverable errors, as they appear on stderr.
 _EXPECTED_ERROR_FRAGMENTS = {
     "(fizzbuzz.bl, line 5)",
-    "(binary_search.bl, line 4)",
+    "(binary_search.bl, line 8)",
 }
 
 
