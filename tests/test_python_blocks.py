@@ -148,18 +148,18 @@ function silent
 
 def test_emitted_output_is_recompiled_as_blocklight_source():
     # An emit()ed line that looks like a block keyword is routed back through the compiler, not
-    # passed through verbatim. `if` blocks aren't implemented yet, so this surfaces that error
-    # rather than writing a bogus "if condition" command line.
+    # passed through verbatim. `while` blocks aren't implemented yet, so this surfaces that error
+    # rather than writing a bogus "while condition" command line.
     out = _compile("""\
 function foo
     python
-        emit("if condition")
+        emit("while condition")
         emit("    say hi")
     say bye
 """)
     assert len(out.errors) == 1
     assert isinstance(out.errors[0], blocklight.BLSyntaxError)
-    assert "'if' block is not yet implemented" in str(out.errors[0])
+    assert "'while' block is not yet implemented" in str(out.errors[0])
     assert out.file_contents == {}
 
 

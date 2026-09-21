@@ -265,3 +265,66 @@ function f
             "execute store result score #_bl_return_value _bl store success score #_bl_return_success _bl run return 1",
         ]
     )
+
+
+# --- Interaction with if/elif/else chains ------------------------------------------------------
+
+
+def test_macro_in_a_bare_ifs_condition_is_forwarded_like_a_modifiers_own_arguments():
+    out = compile_source("""\
+function f
+    if score $(threshold) v matches 1
+        say hi
+""")
+    assert out.errors == []
+    assert out.file_contents == {
+        "data/pack/function/main/f.mcfunction": (
+            "$execute if score $(threshold) v matches 1 run function pack:main/f_helper/chain_0_if"
+        ),
+        "data/pack/function/main/f_helper/chain_0_if.mcfunction": "say hi",
+    }
+
+
+def test_macro_used_only_inside_a_branch_body_is_forwarded_through_the_dispatcher():
+    out = compile_source("""\
+function f
+    if score @a v matches 1
+        say $(x)
+    else
+        say z
+""")
+    assert out.errors == []
+    assert out.file_contents["data/pack/function/main/f.mcfunction"] == (
+        '$function pack:main/f_helper/chain_0 with {"x": "$(x)"}'
+    )
+    dispatcher = out.file_contents["data/pack/function/main/f_helper/chain_0.mcfunction"]
+    assert dispatcher == "\n".join(
+        [
+            '$execute if score @a v matches 1 run return run function pack:main/f_helper/chain_0_if with {"x": "$(x)"}',
+            "return run function pack:main/f_helper/chain_0_else",
+        ]
+    )
+    assert out.file_contents["data/pack/function/main/f_helper/chain_0_if.mcfunction"] == "$say $(x)"
+    assert out.file_contents["data/pack/function/main/f_helper/chain_0_else.mcfunction"] == "say z"
+
+
+def test_macro_in_the_conditions_own_text_and_in_a_branch_body_are_both_forwarded():
+    out = compile_source("""\
+function f
+    if score $(threshold) v matches 1
+        say $(msg)
+    else
+        say z
+""")
+    assert out.errors == []
+    assert out.file_contents["data/pack/function/main/f.mcfunction"] == (
+        '$function pack:main/f_helper/chain_0 with {"msg": "$(msg)", "threshold": "$(threshold)"}'
+    )
+    assert out.file_contents["data/pack/function/main/f_helper/chain_0.mcfunction"] == "\n".join(
+        [
+            "$execute if score $(threshold) v matches 1 run return run function pack:main/f_helper/chain_0_if "
+            'with {"msg": "$(msg)"}',
+            "return run function pack:main/f_helper/chain_0_else",
+        ]
+    )
+    assert out.file_contents["data/pack/function/main/f_helper/chain_0_if.mcfunction"] == "$say $(msg)"

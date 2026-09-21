@@ -6,6 +6,7 @@ import enum
 import hashlib
 import json
 import os
+import re
 import shutil
 import string
 import sys
@@ -891,6 +892,10 @@ class Compile:
     def _compile_lines(self, block_in: _BlockInput, block_out: _BlockOutput, lines: list[_Line], depth: int) -> None:
         counts: dict[str, int] = {}  # Local dict holding # of times each block header is used to name a helper method
 
+        # In-progress if/elif*/else? chain, accumulated one span at a time and compiled as a unit
+        # the moment a span other than a continuing 'elif'/'else' is seen (or spans run out).
+        pending_chain: list[tuple[str, str, list[_Line]]] = []
+
         # Iterate over commands and block headers at depth
         # Spans are a list of one header _Line + child _Lines at greater indentation
         for span in self._iter_spans(lines, self._single_indent(block_in.sf), depth):
@@ -899,6 +904,11 @@ class Compile:
             has_body = len(span) > 1
             keyword, args = line.as_keyword_args()
             keyword_spec = _BLOCK_KEYWORD_SPECS.get(keyword)
+
+            # Anything other than a continuing 'elif'/'else' closes a pending if-chain first.
+            if keyword not in ("elif", "else") and pending_chain:
+                self._compile_if_chain(block_in, block_out, counts, pending_chain, depth)
+                pending_chain = []
 
             # Handle block keywords
             if keyword_spec is not None:
@@ -950,8 +960,20 @@ class Compile:
                                 block_out.lines.append(handler_string)
 
                     case _KeywordType.CONDITIONAL:
-                        tui.tick_discovered()
-                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+                        if keyword == "while":
+                            tui.tick_discovered()
+                            raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
+                        if keyword == "if":
+                            pending_chain = [(keyword, args, span)]
+                        else:  # 'elif' or 'else', continuing the chain just closed above if unrelated
+                            if not pending_chain:
+                                raise BLSyntaxError(
+                                    f"An '{keyword}' block must immediately follow an 'if' or 'elif' block.", line
+                                )
+                            pending_chain.append((keyword, args, span))
+                            if keyword == "else":  # 'else' always ends a chain
+                                self._compile_if_chain(block_in, block_out, counts, pending_chain, depth)
+                                pending_chain = []
 
                     case _KeywordType.INLINE_PYTHON:
                         # Execute python (if permitted) and run emitted lines through this method recursively
@@ -1013,6 +1035,145 @@ class Compile:
             # Handle regular commands
             else:
                 self._append_line_to_block_out(block_out, line)
+
+        # A trailing chain (bare 'if', or 'if'/'elif'* with no 'else') never met a later span to
+        # close it above.
+        if pending_chain:
+            self._compile_if_chain(block_in, block_out, counts, pending_chain, depth)
+
+    # Compile one if/elif*/else? chain (already validated span-by-span). A bare 'if' compiles like
+    # a modifier block. 2+ branches compile to a `chain_N` dispatcher plus one `chain_N_if` /
+    # `chain_N_elif_J` / `chain_N_else` helper per branch, each called unconditionally so every
+    # condition is evaluated at most once and matching exits the dispatcher before that branch's
+    # body runs. See IF_ELIF_ELSE_PLAN.md.
+    def _compile_if_chain(
+        self,
+        block_in: _BlockInput,
+        block_out: _BlockOutput,
+        counts: dict[str, int],
+        chain: list[tuple[str, str, list[_Line]]],
+        depth: int,
+    ) -> None:
+        chain_id = f"chain_{counts.get('if', 0)}"
+        counts["if"] = counts.get("if", 0) + 1
+        if_line = chain[0][2][0]
+
+        # Compile each branch's body into its own helper file, exactly like a modifier's child.
+        branches: list[tuple[str, str, _BlockOutput]] = []  # (condition ('' for else), child_function_name, output)
+        elif_index = 0
+        for keyword, args, span in chain:
+            header_line = span[0]
+            if keyword == "if":
+                branch_name = f"{chain_id}_if"
+                cond = self._parse_condition(args, header_line)
+            elif keyword == "elif":
+                branch_name = f"{chain_id}_elif_{elif_index}"
+                elif_index += 1
+                cond = self._parse_condition(args, header_line)
+            else:
+                branch_name = f"{chain_id}_else"
+                cond = ""
+
+            tui.tick_discovered()
+            child_function_name = f"{block_in.function_name}_helper/{branch_name}"
+            new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
+            new_block_out = _BlockOutput()
+            new_block_out.lines.extend(self._header_lines(block_in.sf.local_path, header_line.lineno))
+            self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
+            tui.tick_processed()
+            orchestration.write_output_file(
+                self._function_filepath(child_function_name),
+                "\n".join(new_block_out.lines),
+                header_line,
+                block_in.sf.local_path,
+                child_function_name.split(":", 1)[0],
+            )
+            branches.append((cond, child_function_name, new_block_out))
+
+        # Bare 'if' (single branch): call exactly like a modifier block, no dispatcher needed.
+        if len(branches) == 1:
+            cond, child_function_name, branch_out = branches[0]
+            macros_string = self._macros_with_clause(branch_out.macros)
+            self._append_line_to_block_out(
+                block_out,
+                _Line(f"execute if {cond} run function {child_function_name}{macros_string}", if_line.lineno),
+            )
+            if branch_out.can_return:
+                block_out.can_return = True
+                for handler_string in _RET_HANDLER_FULL if depth == 1 else _RET_HANDLER_PARTIAL:
+                    block_out.lines.append(handler_string)
+            return
+
+        # Chain (2+ branches): build the dispatcher. Each branch is called via `return run`, so
+        # the instant one condition matches, the dispatcher exits before that branch's body runs
+        # and no later condition is ever evaluated.
+        tui.tick_discovered()
+        dispatcher_function_name = f"{block_in.function_name}_helper/{chain_id}"
+        dispatcher_out = _BlockOutput()
+        dispatcher_out.lines.extend(self._header_lines(block_in.sf.local_path, if_line.lineno))
+        for cond, child_function_name, branch_out in branches:
+            macros_string = self._macros_with_clause(branch_out.macros)
+            if cond:  # 'if' / 'elif': only run (and exit the dispatcher) if the condition matches
+                dispatcher_line = f"execute if {cond} run return run function {child_function_name}{macros_string}"
+            else:  # 'else': unconditional, always last
+                dispatcher_line = f"return run function {child_function_name}{macros_string}"
+            self._append_line_to_block_out(dispatcher_out, _Line(dispatcher_line, if_line.lineno))
+            if branch_out.can_return:
+                dispatcher_out.can_return = True
+        tui.tick_processed()
+        orchestration.write_output_file(
+            self._function_filepath(dispatcher_function_name),
+            "\n".join(dispatcher_out.lines),
+            if_line,
+            block_in.sf.local_path,
+            dispatcher_function_name.split(":", 1)[0],
+        )
+
+        # Call the dispatcher unconditionally; it already decided which branch (if any) matched.
+        macros_string = self._macros_with_clause(dispatcher_out.macros)
+        self._append_line_to_block_out(
+            block_out,
+            _Line(f"function {dispatcher_function_name}{macros_string}", if_line.lineno),
+        )
+        if dispatcher_out.can_return:
+            block_out.can_return = True
+            for handler_string in _RET_HANDLER_FULL if depth == 1 else _RET_HANDLER_PARTIAL:
+                block_out.lines.append(handler_string)
+
+    # Parse an if/elif condition: strip one fully-wrapping outer `(...)` pair (otherwise passed
+    # through unchanged), then reject unimplemented boolean composition.
+    @staticmethod
+    def _parse_condition(args: str, line: _Line) -> str:
+        cond = args
+        if len(cond) >= 2 and cond[0] == "(" and cond[-1] == ")":
+            paren_depth = 0
+            fully_wrapped = True
+            for i, ch in enumerate(cond):
+                if ch == "(":
+                    paren_depth += 1
+                elif ch == ")":
+                    paren_depth -= 1
+                    if paren_depth == 0 and i != len(cond) - 1:
+                        fully_wrapped = False
+                        break
+            if fully_wrapped:
+                cond = cond[1:-1]
+
+        composition_error = BLSyntaxError(
+            "Boolean composition ('and'/'or'/'!') in conditions is not yet implemented.", line
+        )
+        if cond.startswith("!("):
+            raise composition_error
+        paren_depth = 0
+        for match in re.finditer(r"\(|\)|\band\b|\bor\b", cond):
+            token = match.group()
+            if token == "(":
+                paren_depth += 1
+            elif token == ")":
+                paren_depth -= 1
+            elif paren_depth == 0:
+                raise composition_error
+        return cond
 
     @staticmethod
     def _append_line_to_block_out(block_out: _BlockOutput, line: _Line) -> None:
