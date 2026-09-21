@@ -2,6 +2,7 @@
 """Blocklight - A blazing fast mcfunction microcompiler"""
 
 import argparse
+import enum
 import hashlib
 import json
 import os
@@ -27,15 +28,38 @@ _BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DE
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
 _MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")
 _FUNCTION_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))
-_MODIFIER_BLOCK_KEYWORDS = frozenset(
-    ("align", "anchored", "as", "at", "facing", "in", "on", "positioned", "rotated", "summon")
-)
-_RECURSIVE_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "else", "while"))
-_INLINE_BLOCK_KEYWORDS = frozenset(("python",))
-_BLOCK_KEYWORDS = _RECURSIVE_BLOCK_KEYWORDS | _INLINE_BLOCK_KEYWORDS
-_ARG_NOT_REQUIRED_BLOCK_KEYWORDS = frozenset(("python", "else"))
-_ARG_REQUIRED_BLOCK_KEYWORDS = _MODIFIER_BLOCK_KEYWORDS | frozenset(("if", "elif", "while"))
 _MANIFEST_FILENAME = ".blocklight-manifest.json"
+
+
+# ----- Keywords ----- #
+class _KeywordType(enum.Enum):
+    MODIFIER = enum.auto()  # execute-modifier: recurses into a new child .mcfunction
+    CONDITIONAL = enum.auto()  # if / elif / else / while - reserved, not yet implemented
+    INLINE_PYTHON = enum.auto()  # python: expands inline, same depth/block_out
+
+
+class _KeywordSpec(NamedTuple):
+    type: _KeywordType
+    args_required: bool
+
+
+_BLOCK_KEYWORD_SPECS: dict[str, _KeywordSpec] = {
+    "align": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "anchored": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "as": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "at": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "facing": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "in": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "on": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "positioned": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "rotated": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "summon": _KeywordSpec(_KeywordType.MODIFIER, True),
+    "if": _KeywordSpec(_KeywordType.CONDITIONAL, True),
+    "elif": _KeywordSpec(_KeywordType.CONDITIONAL, True),
+    "while": _KeywordSpec(_KeywordType.CONDITIONAL, True),
+    "else": _KeywordSpec(_KeywordType.CONDITIONAL, False),
+    "python": _KeywordSpec(_KeywordType.INLINE_PYTHON, False),
+}
 
 # ----- Scoreboard reserved ----- #
 _BL_RESERVED_SCOREBOARD = "_bl"
@@ -66,6 +90,19 @@ _RET_SET_HOLDERS = f"execute store result score {_BL_VALUE_HOLDER} {_BL_RESERVED
 class _Line(NamedTuple):
     text: str
     lineno: int
+
+    # Parse line as block header (<keyword> <args>)
+    # Return first word of line text as keyword, remainder as args
+    def as_keyword_args(self) -> tuple[str, str]:
+        keyword, _, args = self.text.lstrip().partition(" ")
+        return keyword, args
+
+    # Parse line as function header (<modifiers> function <name>)
+    # Returns function name, is_root, is_load, is_tick
+    def as_function_header(self) -> tuple[str, bool, bool, bool]:
+        modifiers_part, _, name_part = self.text.partition("function ")
+        modifiers = frozenset(modifiers_part.split())
+        return name_part.strip(), "root" in modifiers, "load" in modifiers, "tick" in modifiers
 
 
 # One bl source file's properties stored in the manifest
@@ -809,7 +846,7 @@ class Compile:
             seen_keywords.add(word)
 
         # Validate function name
-        function_name = header_split[1].strip()
+        function_name, is_root, is_load, is_tick = header.as_function_header()
         if not function_name:
             raise BLSyntaxError(
                 "This function definition does not declare a function name (e.g. 'function foo')", header
@@ -823,7 +860,7 @@ class Compile:
 
         # Determine output filepath
         _data, namespace, _src_root, *subdirs, source_file = sf.local_path.split("/")  # /data/<ns>/blocklight/*/f.bl
-        if "root" in seen_keywords:
+        if is_root:
             function_path = function_name
         else:
             function_path = "/".join([*subdirs, source_file.removesuffix(".bl"), function_name])
@@ -845,9 +882,9 @@ class Compile:
 
         # Write output file to disk
         orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
-        if "load" in seen_keywords:
+        if is_load:
             orchestration.register_load_function(output_filepath)
-        if "tick" in seen_keywords:
+        if is_tick:
             orchestration.register_tick_function(output_filepath)
 
     # Compile the commands in `lines` (at `depth`) + recursively compile child blocks
@@ -859,24 +896,24 @@ class Compile:
         for span in self._iter_spans(lines, self._single_indent(block_in.sf), depth):
             line = span[0]
             text = line.text.lstrip()  # right is already stripped
-            keyword, _, args = text.partition(" ")
-            has_keyword = keyword in _BLOCK_KEYWORDS
             has_body = len(span) > 1
+            keyword, args = line.as_keyword_args()
+            keyword_spec = _BLOCK_KEYWORD_SPECS.get(keyword)
 
             # Handle block keywords
-            if has_keyword:
+            if keyword_spec is not None:
                 if not has_body:
                     raise BLSyntaxError(f"This '{keyword}' block has no body.", line)
                 if args.startswith(" "):
                     raise BLSyntaxError("There are too many spaces between the keyword and the arguments.", line)
-                if keyword in _ARG_REQUIRED_BLOCK_KEYWORDS and args == "":
+                if keyword_spec.args_required and args == "":
                     raise BLSyntaxError(f"'{keyword}' block requires arguments.")
-                if keyword in _ARG_NOT_REQUIRED_BLOCK_KEYWORDS and args != "":
-                    raise BLSyntaxError("'{keyword}' block does not take arguments.", line)
+                if not keyword_spec.args_required and args != "":
+                    raise BLSyntaxError(f"'{keyword}' block does not permit arguments.", line)
 
-                if keyword in _RECURSIVE_BLOCK_KEYWORDS:
-                    tui.tick_discovered()
-                    if keyword in _MODIFIER_BLOCK_KEYWORDS:
+                match keyword_spec.type:
+                    case _KeywordType.MODIFIER:
+                        tui.tick_discovered()
                         # Recursively compile this block into
                         # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
                         keyword_count = counts.get(keyword, 0)  # Times this keyword been used in this function
@@ -911,17 +948,15 @@ class Compile:
                             block_out.can_return = True
                             for handler_string in _RET_HANDLER_FULL if depth == 1 else _RET_HANDLER_PARTIAL:
                                 block_out.lines.append(handler_string)
-                    else:
+
+                    case _KeywordType.CONDITIONAL:
+                        tui.tick_discovered()
                         raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
-                elif keyword in _INLINE_BLOCK_KEYWORDS:
-                    if keyword == "python":
+
+                    case _KeywordType.INLINE_PYTHON:
                         # Execute python (if permitted) and run emitted lines through this method recursively
                         emitted = self._handle_python_block(block_in, span, depth)
                         self._compile_lines(block_in, block_out, emitted, depth)
-                    else:
-                        raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
-                else:
-                    raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
 
             # Raise error on regular commands with body
             elif has_body:
