@@ -2,7 +2,7 @@
 # place. Output is left on disk (see .gitignore) for inspection after a test run, but the test
 # deletes any such leftovers from a prior run before compiling, so it stays idempotent even though
 # manifest-driven caching would otherwise skip rewriting unchanged output (see test_manifest.py).
-# Three functions use not-yet-implemented block keywords and are expected to fail and be reported
+# Two functions use not-yet-implemented block keywords and are expected to fail and be reported
 # on stderr.
 
 import shutil
@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import blocklight
+from tests.helpers import strip_header
 
 _BLOCKLIGHT_SCRIPT = Path(__file__).resolve().parents[1] / "blocklight.py"
 _EXAMPLE_PACK = Path(__file__).resolve().parent / "example_pack"
@@ -39,6 +40,20 @@ _EXPECTED_FILE_CONTENTS = {
     "data/bl_example/function/macros/macros_demo_runner.mcfunction": (
         'function bl_example:macros/macros_demo_a with {"a": "hello"}'
     ),
+    "data/bl_example/function/macros/macros_demo_a.mcfunction": (
+        '$execute as @s run function bl_example:macros/macros_demo_a_helper/as_0 with {"a": "$(a)"}\n'
+        '$function bl_example:macros/macros_demo_b with {"a": "$(a)"}'
+    ),
+    "data/bl_example/function/macros/macros_demo_a_helper/as_0.mcfunction": (
+        '$execute at @s run function bl_example:macros/macros_demo_a_helper/as_0_helper/at_0 with {"a": "$(a)"}'
+    ),
+    "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0.mcfunction": (
+        "$execute positioned ~ ~ ~ run function "
+        'bl_example:macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0 with {"a": "$(a)"}'
+    ),
+    "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0.mcfunction": (
+        "$say $(a) from macros_demo_a"
+    ),
     "data/bl_example/function/macros/macros_demo_b.mcfunction": "$say $(a) from macros_demo_b",
     "data/bl_example/function/python/hardcode_example.mcfunction": "\n".join(["say hi"] * 20),
     "data/bl_example/function/python/locators_example.mcfunction": (
@@ -47,23 +62,22 @@ _EXPECTED_FILE_CONTENTS = {
         "say Datapack format: '107'\n"
         "say Namespace: 'bl_example'\n"
         "say Source file: 'python.bl'\n"
-        "say Function name: 'locators_example'\n"
-        f"say Blocklight version: '{blocklight._BL_VERSION}'"  # pyright: ignore[reportPrivateUsage]
+        "say Top-level function name: 'locators_example'\n"
+        "say Minecraft function name containing this script's output: 'bl_example:python/locators_example'\n"
+        f"say Blocklight version: '{blocklight._BL_VERSION_STRING}'"  # pyright: ignore[reportPrivateUsage]
     ),
 }
 
-# Functions using not-yet-implemented block keywords (while/if/as) must not compile.
+# Functions using not-yet-implemented block keywords (while/if) must not compile.
 _EXPECTED_MISSING_FILES = {
     "data/bl_example/function/fizzbuzz/fizzbuzz.mcfunction",
     "data/bl_example/function/binary_search/ocean_floor_height.mcfunction",
-    "data/bl_example/function/macros/macros_demo_a.mcfunction",
 }
 
-# (source basename, line) for the three expected recoverable errors, as they appear on stderr.
+# (source basename, line) for the two expected recoverable errors, as they appear on stderr.
 _EXPECTED_ERROR_FRAGMENTS = {
     "(fizzbuzz.bl, line 5)",
     "(binary_search.bl, line 4)",
-    "(macros.bl, line 3)",
 }
 
 
@@ -72,7 +86,7 @@ def test_compiles_example_pack() -> None:
     _GENERATED_MANIFEST.unlink(missing_ok=True)
 
     result = subprocess.run(
-        [sys.executable, str(_BLOCKLIGHT_SCRIPT), "--no-header"],
+        [sys.executable, str(_BLOCKLIGHT_SCRIPT)],
         cwd=_EXAMPLE_PACK,
         capture_output=True,
         text=True,
@@ -83,6 +97,6 @@ def test_compiles_example_pack() -> None:
         assert fragment in result.stderr
 
     for relative_path, contents in _EXPECTED_FILE_CONTENTS.items():
-        assert (_EXAMPLE_PACK / relative_path).read_text() == contents
+        assert strip_header((_EXAMPLE_PACK / relative_path).read_text()) == contents
     for relative_path in _EXPECTED_MISSING_FILES:
         assert not (_EXAMPLE_PACK / relative_path).exists()

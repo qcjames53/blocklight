@@ -2,7 +2,7 @@
 # pyright: reportPrivateUsage=false
 
 import blocklight
-from tests.helpers import build_lines, compile_source
+from tests.helpers import build_lines, compile_source, make_source_file
 
 
 def test_iter_clean_lines():
@@ -24,7 +24,7 @@ function b:
 function c:
     foo
 """
-    ctx = blocklight.SourceFile(local_path="data/foo/blocklight/main.bl", source_lines=build_lines(source))
+    ctx = make_source_file("data/foo/blocklight/main.bl", source)
     assert list(blocklight.Compile._iter_spans(ctx.source_lines, blocklight.Compile._single_indent(ctx), 0)) == [
         [("function a:", 1), ("    foo", 2), ("    bar", 3)],
         [("function b:", 4)],
@@ -33,7 +33,7 @@ function c:
 
 
 def test_span_iterator_no_functions():
-    ctx = blocklight.SourceFile(local_path="data/foo/blocklight/main.bl", source_lines=[])
+    ctx = make_source_file("data/foo/blocklight/main.bl", "")
     assert list(blocklight.Compile._iter_spans(ctx.source_lines, blocklight.Compile._single_indent(ctx), 0)) == []
     out = compile_source("", local_path="data/blank/blocklight/main.bl")
     assert out.file_contents == {} and out.errors == []

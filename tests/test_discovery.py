@@ -9,7 +9,7 @@ import pytest
 import blocklight
 from tests.helpers import reset_for_test, run_compile, scratch_dir
 
-_DRY_RUN = blocklight.CompilerOptions(no_header=True, dry_run=True)
+_DRY_RUN = blocklight.CompilerOptions(dry_run=True)
 
 
 def _write_pack(pack_meta: dict[str, object]) -> None:
@@ -97,8 +97,8 @@ def test_invalid_pack_name_is_recoverable():
 def test_invalid_namespace_is_skipped_but_others_still_compile():
     with scratch_dir():
         _write_pack({"pack": {"min_format": 1}})
-        _write_source("Bad Namespace", "main.bl", "function hello:\n    say hi\n")
-        _write_source("good_ns", "main.bl", "function hello:\n    say hi\n")
+        _write_source("Bad Namespace", "main.bl", "function hello\n    say hi\n")
+        _write_source("good_ns", "main.bl", "function hello\n    say hi\n")
         result = run_compile(_DRY_RUN)
     assert len(result.errors) == 1
     assert isinstance(result.errors[0], blocklight.BLSyntaxError)
@@ -108,7 +108,7 @@ def test_invalid_namespace_is_skipped_but_others_still_compile():
 def test_dry_run_does_not_write_output_files_to_disk():
     with scratch_dir():
         _write_pack({"pack": {"min_format": 1}})
-        _write_source("ns", "main.bl", "function hello:\n    say hi\n")
+        _write_source("ns", "main.bl", "function hello\n    say hi\n")
         result = run_compile(_DRY_RUN)
     # get_files() reflects what *would* be compiled, but nothing should actually touch disk.
     assert result.files == {"data/ns/function/main/hello.mcfunction"}
@@ -126,8 +126,8 @@ def test_no_data_directory_produces_no_files_or_errors():
 def test_discovers_and_compiles_multiple_namespaces_and_files():
     with scratch_dir():
         _write_pack({"pack": {"min_format": 1}})
-        _write_source("ns_a", "one.bl", "function foo:\n    say foo\n")
-        _write_source("ns_b", "nested/two.bl", "root function bar:\n    say bar\n")
+        _write_source("ns_a", "one.bl", "function foo\n    say foo\n")
+        _write_source("ns_b", "nested/two.bl", "root function bar\n    say bar\n")
         result = run_compile(_DRY_RUN)
     assert result.errors == []
     assert result.files == {
@@ -152,7 +152,7 @@ def test_unanticipated_compile_error_is_reported_not_swallowed():
     # for their result otherwise.
     with scratch_dir():
         _write_pack({"pack": {"min_format": 1}})
-        _write_source("ns", "main.bl", "function hello:\n    say hi\n")
+        _write_source("ns", "main.bl", "function hello\n    say hi\n")
         with unittest.mock.patch("blocklight.hashlib.sha256", side_effect=RuntimeError("boom")):
             result = run_compile(_DRY_RUN)
     assert len(result.errors) == 1
@@ -168,7 +168,7 @@ def test_invalid_utf8_source_file_is_a_bl_file_error():
         path = os.path.join("data", "ns", "blocklight", "main.bl")
         os.makedirs(os.path.dirname(path))
         with open(path, "wb") as f:
-            f.write(b"function hello:\n    say \xff\xfe\n")
+            f.write(b"function hello\n    say \xff\xfe\n")
         result = run_compile(_DRY_RUN)
     assert len(result.errors) == 1
     assert isinstance(result.errors[0], blocklight.BLFileError)
