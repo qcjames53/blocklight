@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import string
 import sys
 import textwrap
@@ -16,7 +15,7 @@ import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import NamedTuple, cast
+from typing import ClassVar, NamedTuple, cast
 
 # ----- Tweakable constants ----- #
 _BL_VERSION = (1, 0)
@@ -27,9 +26,6 @@ _FILE_WRITE_WORKERS_COUNT = 8
 # ----- Compiler internal constants ----- #
 _BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
-_MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")
-_FUNCTION_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))
-_MANIFEST_FILENAME = ".blocklight-manifest.json"
 
 
 # ----- Keywords ----- #
@@ -42,49 +38,6 @@ class _KeywordType(enum.Enum):
 class _KeywordSpec(NamedTuple):
     type: _KeywordType
     args_required: bool
-
-
-_BLOCK_KEYWORD_SPECS: dict[str, _KeywordSpec] = {
-    "align": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "anchored": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "as": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "at": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "facing": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "in": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "on": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "positioned": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "rotated": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "summon": _KeywordSpec(_KeywordType.MODIFIER, True),
-    "if": _KeywordSpec(_KeywordType.CONDITIONAL, True),
-    "elif": _KeywordSpec(_KeywordType.CONDITIONAL, True),
-    "while": _KeywordSpec(_KeywordType.CONDITIONAL, True),
-    "else": _KeywordSpec(_KeywordType.CONDITIONAL, False),
-    "python": _KeywordSpec(_KeywordType.INLINE_PYTHON, False),
-}
-
-# ----- Scoreboard reserved ----- #
-_BL_RESERVED_SCOREBOARD = "_bl"
-_BL_RETURNING_HOLDER = "#_bl_returning"
-_BL_SUCCESS_HOLDER = "#_bl_return_success"
-_BL_VALUE_HOLDER = "#_bl_return_value"
-
-# ----- Compiled output strings ----- #
-_HEADER_MARKER = "Compiled by Blocklight"
-_HEADER_TEXT = [
-    f"# {_HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)",
-    "# Changes saved to this file will not persist. Please modify the bl source file instead:",
-]
-# Catch that a child function returned, get return success and value then forward up the call chain
-_RET_HANDLER_FULL = [
-    f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}",  # noqa: E501
-    f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail",  # noqa: E501
-]
-# Catch that a child function returned and also return this function. Used as optimized middleman in call stack.
-_RET_HANDLER_PARTIAL = [f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return 0"]
-# Mark that child method decided to return
-_RET_MARK_RETURNING = f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1"
-# Set the return success and value holders and return something
-_RET_SET_HOLDERS = f"execute store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run return "  # noqa: E501
 
 
 # One line in bl source tracking original line number
@@ -177,7 +130,7 @@ class SourceFile:
             hasher.update(b"\n")
         return hasher.hexdigest()
 
-    # Yeilds cleans lines from any (line number, raw text) source.
+    # Yields clean lines from any (line number, raw text) source.
     @staticmethod
     def _iter_clean_lines(numbered_lines: Iterable[tuple[int, str]]) -> Iterator[_Line]:
         pending: _Line | None = None
@@ -242,23 +195,13 @@ class _PythonBlockContext:
 
 # Parses CLI args and drives user-facing progress UI
 class TUI:
-    _SPINNER_FRAMES = "|/-\\"
-    _REDRAW_INTERVAL = 1 / 15
-
     def __init__(self) -> None:
         self._options = CompilerOptions()
         self._errors: list[BLError] = []
         self._lock = threading.Lock()  # guards _errors and the three tick counters below
-        self._discovered = 0
-        self._processed = 0
         self._written = 0
+        self._skipped = 0
         self._start_time = 0.0
-        self._render_lock = threading.Lock()  # serializes all stderr writes (footer draws + print)
-        self._footer_thread: threading.Thread | None = None
-        self._footer_stop = threading.Event()
-        self._footer_active = False
-        self._footer_len = 0  # length of the last-drawn footer, so redraws fully overwrite it
-        self._spinner_index = 0
 
     def set_options(self, options: CompilerOptions) -> None:
         self._options = options
@@ -323,88 +266,30 @@ class TUI:
             return list(self._errors)
 
     # Thread safe
-    def tick_discovered(self) -> None:
-        with self._lock:
-            self._discovered += 1
-
-    # Thread safe
-    def tick_processed(self) -> None:
-        with self._lock:
-            self._processed += 1
-
-    # Thread safe
     def tick_written(self) -> None:
         with self._lock:
             self._written += 1
 
+    def tick_skipped(self) -> None:
+        with self._lock:
+            self._skipped += 1
+
     # Starts the compile clock and the live footer (if tty).
     def start(self) -> None:
         self._start_time = time.monotonic()
-        if not sys.stderr.isatty():
-            return
-        self._footer_active = True
-        self._footer_stop.clear()
-
-        def render_loop() -> None:
-            while True:
-                with self._render_lock:
-                    self._draw_footer()
-                if self._footer_stop.wait(self._REDRAW_INTERVAL):
-                    return
-
-        self._footer_thread = threading.Thread(target=render_loop, daemon=True)
-        self._footer_thread.start()
-
-    def _footer_text(self) -> str:
-        with self._lock:
-            discovered, processed, written = self._discovered, self._processed, self._written
-        spinner = self._SPINNER_FRAMES[self._spinner_index % len(self._SPINNER_FRAMES)]
-        self._spinner_index += 1
-        elapsed = time.monotonic() - self._start_time
-        left = f"{spinner} ({discovered} discovered, {processed} processed, {written} written)"
-        right = f"{elapsed:.3f}s "
-        width = shutil.get_terminal_size(fallback=(80, 24)).columns
-        gap = max(1, width - len(left) - len(right))
-        return f"{left}{' ' * gap}{right}"[:width]
-
-    # Caller must hold _render_lock.
-    def _draw_footer(self) -> None:
-        line = self._footer_text()
-        pad = max(0, self._footer_len - len(line))
-        sys.stderr.write("\r" + line + (" " * pad))
-        sys.stderr.flush()
-        self._footer_len = len(line)
 
     # Prints a line of output, keeping the footer pinned to the bottom line.
     def print(self, message: str) -> None:
-        with self._render_lock:
-            if self._footer_active:
-                sys.stderr.write("\r" + (" " * self._footer_len) + "\r")
-                sys.stderr.write(message + "\n")
-                self._draw_footer()
-            else:
-                sys.stderr.write(message + "\n")
-            sys.stderr.flush()
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
 
     # Stops the footer (if running) and prints the final summary
     def finish(self) -> None:
-        if self._footer_active:
-            self._footer_stop.set()
-            if self._footer_thread is not None:
-                self._footer_thread.join()
-            self._footer_active = False
-            with self._render_lock:
-                sys.stderr.write("\r" + (" " * self._footer_len) + "\r")
-                sys.stderr.flush()
-                self._footer_len = 0
         elapsed = time.monotonic() - self._start_time
-        with self._lock:
-            written, discovered = self._written, self._discovered
-            had_errors = bool(self._errors)
         summary = (
-            f"Compiled {orchestration.get_pack_name()} in {elapsed:.3f} seconds. [{written} / {discovered}] output"
+            f"Compiled {orchestration.get_pack_name()} in {elapsed:.3f} seconds. [{self._written} written / {self._skipped} skipped]"
         )
-        if had_errors:
+        if self._errors:
             summary += " (see above for errors)"
         self.print(summary)
 
@@ -412,6 +297,8 @@ class TUI:
 # Owns pack.mcmeta/manifest state, discovery, both thread pools, and every datapack-level
 # collection (compiled files, load/tick functions, bl source hashes/outputs, needs_recompile).
 class Orchestration:
+    _MANIFEST_FILENAME = ".blocklight-manifest.json"
+
     def __init__(self) -> None:
         self._pack_name: str = ""
         self._pack_format: int | None = None
@@ -463,9 +350,7 @@ class Orchestration:
     def reuse_output_file(self, local_path: str, output: str) -> None:
         self._files.add(output)
         self._source_outputs.setdefault(local_path, set()).add(output)
-        tui.tick_discovered()
-        tui.tick_processed()
-        tui.tick_written()
+        tui.tick_skipped()
         if self._previous_manifest is None:
             return
         function_id = self._function_id(output)
@@ -497,25 +382,6 @@ class Orchestration:
             return
         self._write_executor.submit(self._persist_file, filepath, contents, function_def_line, local_path)
 
-    # Writes output file to disk.
-    def _persist_file(self, filepath: str, contents: str, function_def_line: _Line, local_path: str) -> None:
-        try:
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            with open(filepath, "x", encoding="utf-8") as f:
-                f.write(contents)
-        except FileExistsError:
-            err = BLFileError(f"Another function already compiles to '{filepath}'.", function_def_line)
-            self.report_error(local_path, err)
-            return
-        except OSError as ose:
-            err = BLFileError(f"Failed to write '{filepath}': {ose.strerror}.", function_def_line)
-            self.report_error(local_path, err)
-            return
-        # Mutated from many write-pool threads; relies on the GIL for these single-op updates.
-        self._files.add(filepath)
-        self._source_outputs.setdefault(local_path, set()).add(filepath)
-        tui.tick_written()
-
     # Wait for all write executors to finish.
     def wait_for_writes(self) -> None:
         self._write_executor.shutdown(wait=True)
@@ -534,7 +400,7 @@ class Orchestration:
             error = BLFileError(f"Failed to verify '{filepath}' before deleting: {err.strerror}.")
             self.report_error(local_path, error)
             return
-        if _HEADER_MARKER not in content:
+        if Compile.HEADER_MARKER not in content:
             error = BLFileError(f"Refusing to delete '{filepath}': missing the Blocklight header.")
             self.report_error(local_path, error)
             return
@@ -545,6 +411,82 @@ class Orchestration:
         except OSError as err:
             error = BLFileError(f"Failed to delete stale file '{filepath}': {err.strerror}.")
             self.report_error(local_path, error)
+
+    # Locate pack.mcmeta and every .bl file under data/<namespace>/blocklight/, compiling each
+    # concurrently, then write the manifest.
+    def run(self) -> None:
+        if not os.path.isfile("pack.mcmeta"):
+            raise SystemExit("No pack.mcmeta found in the current directory.")
+        with open("pack.mcmeta", encoding="utf-8") as f:
+            try:
+                pack_meta: dict[str, object] = json.load(f)
+            except json.JSONDecodeError as err:
+                raise SystemExit(f"pack.mcmeta is not valid JSON: {err}") from err
+
+        self._pack_format = self._read_pack_format(pack_meta)
+        self._pack_name = os.path.basename(os.getcwd())
+        if set(self._pack_name) - _FUNCTION_NAME_CHARS:
+            tui.log_error(
+                BLSyntaxError(f"The datapack directory name '{self._pack_name}' may only use a-z, 0-9, '_' and '-'.")
+            )
+
+        if not os.path.isdir("data"):
+            return
+
+        self._previous_manifest = self._read_manifest()
+
+        discovered: dict[str, str] = {}  # local_path -> namespace
+        for namespace in sorted(os.listdir("data")):
+            namespace_dir = os.path.join("data", namespace)
+            if not os.path.isdir(namespace_dir):
+                continue
+            if set(namespace) - _FUNCTION_NAME_CHARS:
+                tui.log_error(BLSyntaxError(f"The namespace '{namespace}' may only use a-z, 0-9, '_' and '-'."))
+                continue
+            blocklight_dir = os.path.join(namespace_dir, "blocklight")
+            for local_path in self._iter_bl_files(blocklight_dir):
+                discovered[local_path] = namespace
+
+        # Sources present in the last manifest but not found this run: their outputs are orphaned.
+        previous_manifest = self._previous_manifest
+        if not tui.get_dry_run() and previous_manifest is not None:
+            for local_path in sorted(set(previous_manifest.sources) - set(discovered)):
+                for output in previous_manifest.sources[local_path].outputs:
+                    self.delete_stale_output(output, local_path)
+
+        with ThreadPoolExecutor() as executor:
+            futures = {
+                executor.submit(Compile(local_path, namespace).compile): local_path
+                for local_path, namespace in discovered.items()
+            }
+            for future, local_path in futures.items():
+                try:
+                    future.result()
+                except Exception as err:  # a bug or unanticipated failure must not vanish silently
+                    self.report_error(local_path, BLFileError(f"Unexpected error while compiling: {err}"))
+
+        self.wait_for_writes()
+        if not tui.get_dry_run():
+            self._write_manifest()
+
+    # Writes output file to disk.
+    def _persist_file(self, filepath: str, contents: str, function_def_line: _Line, local_path: str) -> None:
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, "x", encoding="utf-8") as f:
+                f.write(contents)
+        except FileExistsError:
+            err = BLFileError(f"Another function already compiles to '{filepath}'.", function_def_line)
+            self.report_error(local_path, err)
+            return
+        except OSError as ose:
+            err = BLFileError(f"Failed to write '{filepath}': {ose.strerror}.", function_def_line)
+            self.report_error(local_path, err)
+            return
+        # Mutated from many write-pool threads; relies on the GIL for these single-op updates.
+        self._files.add(filepath)
+        self._source_outputs.setdefault(local_path, set()).add(filepath)
+        tui.tick_written()
 
     def _read_pack_format(self, pack_meta: dict[str, object]) -> int | None:
         pack_obj = pack_meta.get("pack")
@@ -592,7 +534,7 @@ class Orchestration:
     # Load the previous run's manifest, if any. A missing or corrupt manifest is treated as empty.
     def _read_manifest(self) -> _Manifest | None:
         try:
-            with open(_MANIFEST_FILENAME, encoding="utf-8") as f:
+            with open(self._MANIFEST_FILENAME, encoding="utf-8") as f:
                 raw: object = json.load(f)
         except (OSError, json.JSONDecodeError):
             return None
@@ -635,7 +577,7 @@ class Orchestration:
                 for local_path, content_hash in self._source_hashes.items()
             },
         }
-        with open(_MANIFEST_FILENAME, "w", encoding="utf-8") as f:
+        with open(self._MANIFEST_FILENAME, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
 
     # Yield .bl paths under blocklight_dir. With no_symlink, refuses to follow symlinked
@@ -666,82 +608,69 @@ class Orchestration:
                     continue
                 yield path
 
-    # Locate pack.mcmeta and every .bl file under data/<namespace>/blocklight/, compiling each
-    # concurrently, then write the manifest.
-    def run(self) -> None:
-        if not os.path.isfile("pack.mcmeta"):
-            raise SystemExit("No pack.mcmeta found in the current directory.")
-        with open("pack.mcmeta", encoding="utf-8") as f:
-            try:
-                pack_meta: dict[str, object] = json.load(f)
-            except json.JSONDecodeError as err:
-                raise SystemExit(f"pack.mcmeta is not valid JSON: {err}") from err
-
-        self._pack_format = self._read_pack_format(pack_meta)
-        self._pack_name = os.path.basename(os.getcwd())
-        if set(self._pack_name) - _FUNCTION_NAME_CHARS:
-            tui.log_error(
-                BLSyntaxError(f"The datapack directory name '{self._pack_name}' may only use a-z, 0-9, '_' and '-'.")
-            )
-
-        if not os.path.isdir("data"):
-            return
-
-        self._previous_manifest = self._read_manifest()
-
-        discovered: dict[str, str] = {}  # local_path -> namespace
-        for namespace in sorted(os.listdir("data")):
-            namespace_dir = os.path.join("data", namespace)
-            if not os.path.isdir(namespace_dir):
-                continue
-            if set(namespace) - _FUNCTION_NAME_CHARS:
-                tui.log_error(BLSyntaxError(f"The namespace '{namespace}' may only use a-z, 0-9, '_' and '-'."))
-                continue
-            blocklight_dir = os.path.join(namespace_dir, "blocklight")
-            for local_path in self._iter_bl_files(blocklight_dir):
-                discovered[local_path] = namespace
-
-        # Sources present in the last manifest but not found this run: their outputs are orphaned.
-        previous_manifest = self._previous_manifest
-        if not tui.get_dry_run() and previous_manifest is not None:
-            for local_path in sorted(set(previous_manifest.sources) - set(discovered)):
-                for output in previous_manifest.sources[local_path].outputs:
-                    self.delete_stale_output(output, local_path)
-
-        with ThreadPoolExecutor() as executor:
-            futures = {
-                executor.submit(Compile(local_path, namespace).run): local_path
-                for local_path, namespace in discovered.items()
-            }
-            for future, local_path in futures.items():
-                try:
-                    future.result()
-                except Exception as err:  # a bug or unanticipated failure must not vanish silently
-                    self.report_error(local_path, BLFileError(f"Unexpected error while compiling: {err}"))
-
-        self.wait_for_writes()
-        if not tui.get_dry_run():
-            self._write_manifest()
-
 
 # One instance per bl source file, constructed and run inside Orchestration's discovery pool.
 class Compile:
+    _FUNCTION_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))
+    _MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")
+    _BLOCK_KEYWORD_SPECS: ClassVar[dict[str, _KeywordSpec]] = {
+        "align": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "anchored": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "as": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "at": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "facing": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "in": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "on": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "positioned": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "rotated": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "summon": _KeywordSpec(_KeywordType.MODIFIER, True),
+        "if": _KeywordSpec(_KeywordType.CONDITIONAL, True),
+        "elif": _KeywordSpec(_KeywordType.CONDITIONAL, True),
+        "while": _KeywordSpec(_KeywordType.CONDITIONAL, True),
+        "else": _KeywordSpec(_KeywordType.CONDITIONAL, False),
+        "python": _KeywordSpec(_KeywordType.INLINE_PYTHON, False),
+    }
+
+    # ----- Scoreboard reserved ----- #
+    _BL_RESERVED_SCOREBOARD = "_bl"
+    _BL_RETURNING_HOLDER = "#_bl_returning"
+    _BL_SUCCESS_HOLDER = "#_bl_return_success"
+    _BL_VALUE_HOLDER = "#_bl_return_value"
+
+    # ----- Compiled output strings ----- #
+    HEADER_MARKER = "Compiled by Blocklight"
+    _HEADER_TEXT: ClassVar[list[str]] = [
+        f"# {HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)",
+        "# Changes saved to this file will not persist. Please modify the bl source file instead:",
+    ]
+    # Catch that a child function returned, get return success and value then forward up the call chain
+    _RET_HANDLER_FULL: ClassVar[list[str]] = [
+        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}",  # noqa: E501
+        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail",  # noqa: E501
+    ]
+    # Catch that a child function returned and also return this function. Used as optimized middleman in call stack.
+    _RET_HANDLER_PARTIAL: ClassVar[list[str]] = [
+        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return 0"
+    ]
+    # Mark that child method decided to return
+    _RET_MARK_RETURNING = f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1"
+    # Set the return success and value holders and return something
+    _RET_SET_HOLDERS = f"execute store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run return "  # noqa: E501
+
     def __init__(self, local_path: str, namespace: str) -> None:
-        self.local_path = local_path
-        self.namespace = namespace
+        self._local_path = local_path
+        self._namespace = namespace
 
     # Reads the bl source file, determines if compile is needed, then deletes old output and recompiles
-    def run(self) -> None:
-        tui.tick_discovered()
+    def compile(self) -> None:
         try:
-            sf = SourceFile(self.local_path, self.namespace)
+            sf = SourceFile(self._local_path, self._namespace)
         except BLFileError:
             return
-        tui.tick_processed()
         content_hash = sf.content_hash
 
-        previous_entry = orchestration.get_previous_manifest_entry(self.local_path)
-        orchestration.record_source(self.local_path, content_hash)
+        previous_entry = orchestration.get_previous_manifest_entry(self._local_path)
+        orchestration.record_source(self._local_path, content_hash)
         previous_compiler_version = orchestration.get_previous_compiler_version()
 
         # Skip recompile of already-compiled files under circumstances considered safe
@@ -753,19 +682,14 @@ class Compile:
             and previous_entry.source_hash == content_hash
         ):
             for output in previous_entry.outputs:
-                orchestration.reuse_output_file(self.local_path, output)
-            tui.tick_written()
+                orchestration.reuse_output_file(self._local_path, output)
             return
 
         if previous_entry is not None and not tui.get_dry_run():
             for output in previous_entry.outputs:
-                orchestration.delete_stale_output(output, self.local_path)
+                orchestration.delete_stale_output(output, self._local_path)
 
-        self.compile(sf)
-        tui.tick_written()
-
-    # Compile every function in `sf`, isolating recoverable errors to the function that raised them.
-    def compile(self, sf: SourceFile) -> None:
+        # Compile every function in `sf`, isolating recoverable errors to the function that raised them.
         try:
             for function_lines in self._iter_spans(sf.source_lines, self._single_indent(sf), 0):
                 try:
@@ -822,7 +746,7 @@ class Compile:
     # Header lines every compiled output file (including helpers) begins with.
     @staticmethod
     def _header_lines(local_path: str, lineno: int) -> list[str]:
-        return [*_HEADER_TEXT, f"#     `{local_path}:{lineno}`"]
+        return [*Compile._HEADER_TEXT, f"#     `{local_path}:{lineno}`"]
 
     # Validate a function header and compile its body to an mcfunction file.
     def _compile_function(self, sf: SourceFile, lines: list[_Line]) -> None:
@@ -840,7 +764,7 @@ class Compile:
         # Validate header keywords
         seen_keywords: set[str] = set()
         for word in header_split[0].split():
-            if word not in _FUNCTION_HEADER_KEYWORDS:
+            if word not in self._FUNCTION_HEADER_KEYWORDS:
                 raise BLSyntaxError(f"This function definition declares an unknown keyword: '{word}'", header)
             if word in seen_keywords:
                 raise BLSyntaxError(f"This function definition declares '{word}' twice.", header)
@@ -867,7 +791,6 @@ class Compile:
             function_path = "/".join([*subdirs, source_file.removesuffix(".bl"), function_name])
         block_in = _BlockInput(sf, function_name, f"{namespace}:{function_path}")
         output_filepath = self._function_filepath(block_in.function_name)
-        tui.tick_discovered()
 
         # Build function and helpers
         block_out = _BlockOutput()
@@ -876,10 +799,9 @@ class Compile:
         if block_out.can_return:
             # If compiled lines can return, reset the "is currently returning" flag on function call
             block_out.lines.insert(
-                len(_HEADER_TEXT) + 1,  # Insert after header text
-                f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 0",
+                len(self._HEADER_TEXT) + 1,  # Insert after header text
+                f"scoreboard players set {self._BL_RETURNING_HOLDER} {self._BL_RESERVED_SCOREBOARD} 0",
             )
-        tui.tick_processed()
 
         # Write output file to disk
         orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
@@ -903,7 +825,7 @@ class Compile:
             text = line.text.lstrip()  # right is already stripped
             has_body = len(span) > 1
             keyword, args = line.as_keyword_args()
-            keyword_spec = _BLOCK_KEYWORD_SPECS.get(keyword)
+            keyword_spec = self._BLOCK_KEYWORD_SPECS.get(keyword)
 
             # Anything other than a continuing 'elif'/'else' closes a pending if-chain first.
             if keyword not in ("elif", "else") and pending_chain:
@@ -923,17 +845,15 @@ class Compile:
 
                 match keyword_spec.type:
                     case _KeywordType.MODIFIER:
-                        tui.tick_discovered()
                         # Recursively compile this block into
                         # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
-                        keyword_count = counts.get(keyword, 0)  # Times this keyword been used in this function
+                        keyword_count = counts.get(keyword, 0)  # Times this keyword has been used in this function
                         counts[keyword] = keyword_count + 1
                         child_function_name = f"{block_in.function_name}_helper/{keyword}_{keyword_count}"
                         new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
                         new_block_out = _BlockOutput()
                         new_block_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
                         self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
-                        tui.tick_processed()
                         orchestration.write_output_file(
                             self._function_filepath(child_function_name),
                             "\n".join(new_block_out.lines),
@@ -956,12 +876,11 @@ class Compile:
                         # Match success and return value if this is depth of 1 for proper propagation.
                         if new_block_out.can_return:
                             block_out.can_return = True
-                            for handler_string in _RET_HANDLER_FULL if depth == 1 else _RET_HANDLER_PARTIAL:
+                            for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
                                 block_out.lines.append(handler_string)
 
                     case _KeywordType.CONDITIONAL:
                         if keyword == "while":
-                            tui.tick_discovered()
                             raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
                         if keyword == "if":
                             pending_chain = [(keyword, args, span)]
@@ -998,10 +917,10 @@ class Compile:
                 child_filepath = f"{block_in.function_name}_helper/return_{return_count}"
                 child_block_out = _BlockOutput()
                 child_block_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
-                child_block_out.lines.append(_RET_MARK_RETURNING)
+                child_block_out.lines.append(self._RET_MARK_RETURNING)
                 self._append_line_to_block_out(
                     child_block_out,
-                    _Line(_RET_SET_HOLDERS + return_command_tail, line.lineno),
+                    _Line(self._RET_SET_HOLDERS + return_command_tail, line.lineno),
                 )
                 orchestration.write_output_file(
                     self._function_filepath(child_filepath),
@@ -1026,10 +945,10 @@ class Compile:
             elif text.startswith("return "):
                 block_out.can_return = True
                 return_command_tail = text[len("return ") :]
-                block_out.lines.append(_RET_MARK_RETURNING)
+                block_out.lines.append(self._RET_MARK_RETURNING)
                 self._append_line_to_block_out(
                     block_out,
-                    _Line(_RET_SET_HOLDERS + return_command_tail, line.lineno),
+                    _Line(self._RET_SET_HOLDERS + return_command_tail, line.lineno),
                 )
 
             # Handle regular commands
@@ -1041,24 +960,14 @@ class Compile:
         if pending_chain:
             self._compile_if_chain(block_in, block_out, counts, pending_chain, depth)
 
-    # Compile one if/elif*/else? chain (already validated span-by-span). A bare 'if' compiles like
-    # a modifier block. 2+ branches compile to a `chain_N` dispatcher plus one `chain_N_if` /
-    # `chain_N_elif_J` / `chain_N_else` helper per branch, each called unconditionally so every
-    # condition is evaluated at most once and matching exits the dispatcher before that branch's
-    # body runs. See IF_ELIF_ELSE_PLAN.md.
-    def _compile_if_chain(
-        self,
-        block_in: _BlockInput,
-        block_out: _BlockOutput,
-        counts: dict[str, int],
-        chain: list[tuple[str, str, list[_Line]]],
-        depth: int,
-    ) -> None:
+    # Compile one if-elif-else chain
+    def _compile_if_chain(self, block_in: _BlockInput, block_out: _BlockOutput, counts: dict[str, int],
+                          chain: list[tuple[str, str, list[_Line]]], depth: int) -> None:
         chain_id = f"chain_{counts.get('if', 0)}"
         counts["if"] = counts.get("if", 0) + 1
         if_line = chain[0][2][0]
 
-        # Compile each branch's body into its own helper file, exactly like a modifier's child.
+        # Compile each branch's body recursively
         branches: list[tuple[str, str, _BlockOutput]] = []  # (condition ('' for else), child_function_name, output)
         elif_index = 0
         for keyword, args, span in chain:
@@ -1074,13 +983,11 @@ class Compile:
                 branch_name = f"{chain_id}_else"
                 cond = ""
 
-            tui.tick_discovered()
             child_function_name = f"{block_in.function_name}_helper/{branch_name}"
             new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
             new_block_out = _BlockOutput()
             new_block_out.lines.extend(self._header_lines(block_in.sf.local_path, header_line.lineno))
             self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
-            tui.tick_processed()
             orchestration.write_output_file(
                 self._function_filepath(child_function_name),
                 "\n".join(new_block_out.lines),
@@ -1100,14 +1007,11 @@ class Compile:
             )
             if branch_out.can_return:
                 block_out.can_return = True
-                for handler_string in _RET_HANDLER_FULL if depth == 1 else _RET_HANDLER_PARTIAL:
+                for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
                     block_out.lines.append(handler_string)
             return
 
-        # Chain (2+ branches): build the dispatcher. Each branch is called via `return run`, so
-        # the instant one condition matches, the dispatcher exits before that branch's body runs
-        # and no later condition is ever evaluated.
-        tui.tick_discovered()
+        # Chains containing elif or else use a helper function.
         dispatcher_function_name = f"{block_in.function_name}_helper/{chain_id}"
         dispatcher_out = _BlockOutput()
         dispatcher_out.lines.extend(self._header_lines(block_in.sf.local_path, if_line.lineno))
@@ -1120,7 +1024,6 @@ class Compile:
             self._append_line_to_block_out(dispatcher_out, _Line(dispatcher_line, if_line.lineno))
             if branch_out.can_return:
                 dispatcher_out.can_return = True
-        tui.tick_processed()
         orchestration.write_output_file(
             self._function_filepath(dispatcher_function_name),
             "\n".join(dispatcher_out.lines),
@@ -1137,7 +1040,7 @@ class Compile:
         )
         if dispatcher_out.can_return:
             block_out.can_return = True
-            for handler_string in _RET_HANDLER_FULL if depth == 1 else _RET_HANDLER_PARTIAL:
+            for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
                 block_out.lines.append(handler_string)
 
     # Parse an if/elif condition: strip one fully-wrapping outer `(...)` pair (otherwise passed
@@ -1160,7 +1063,7 @@ class Compile:
                 cond = cond[1:-1]
 
         composition_error = BLSyntaxError(
-            "Boolean composition ('and'/'or'/'!') in conditions is not yet implemented.", line
+            "Boolean composition ('and'/'or'/'not') in conditions is not yet implemented.", line
         )
         if cond.startswith("!("):
             raise composition_error
@@ -1208,7 +1111,7 @@ class Compile:
             name = line.text[name_start + 2 : name_end]
             if not name:
                 raise BLSyntaxError("This line declares an empty macro '$()'.", line)
-            if set(name) - _MACRO_NAME_CHARS:
+            if set(name) - Compile._MACRO_NAME_CHARS:
                 raise BLSyntaxError(f"Macro names may only use a-z, A-Z, 0-9 and '_': '$({name})'", line)
             yield name
             search_from = name_end + 1
@@ -1221,7 +1124,7 @@ class Compile:
         body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
 
         if tui.get_no_python():
-            raise BLSyntaxError("This Python blocks is disabled due to your compile parameters.", head)
+            raise BLSyntaxError("This Python block is disabled due to your compile parameters.", head)
         orchestration.mark_needs_recompile(sf.local_path)
         emitted: list[str] = []
 
