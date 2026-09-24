@@ -2,10 +2,13 @@
 
 function fizzbuzz
     scoreboard players set #i example_var 1
+    scoreboard players set #3 example_var 3
+    scoreboard players set #5 example_var 5
     while (score #i example_var matches ..$(max))
-        python
-            bl.eval("#mod_a:example_var = #i:example_var % 3")
-            bl.eval("#mod_b:example_var = #i:example_var % 5")
+        scoreboard players operation #mod_a example_var = #i example_var
+        scoreboard players operation #mod_a example_var %= #3 example_var
+        scoreboard players operation #mod_b example_var = #i example_var
+        scoreboard players operation #mod_b example_var %= #5 example_var
 
         if (score #mod_a example_var matches 0) and (score #mod_b example_var matches 0)
             $say $(string_ab)
