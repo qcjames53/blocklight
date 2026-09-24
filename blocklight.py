@@ -6,13 +6,12 @@ import enum
 import hashlib
 import json
 import os
-import re
 import string
 import sys
 import textwrap
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import ClassVar, NamedTuple, cast
@@ -57,6 +56,21 @@ class _Line(NamedTuple):
         modifiers_part, _, name_part = self.text.partition("function ")
         modifiers = frozenset(modifiers_part.split())
         return name_part.strip(), "root" in modifiers, "load" in modifiers, "tick" in modifiers
+
+
+# Condition leaf: body of one `execute if` subcommand, e.g. "score @s v matches 1"
+class _CondAtom(NamedTuple):
+    text: str
+    negated: bool = False  # compiles to `unless` instead of `if`
+
+
+# Condition operator node. `op` is "and", "or" or "not" (one term).
+class _CondOp(NamedTuple):
+    op: str
+    terms: tuple["_CondAtom | _CondOp", ...]
+
+
+_CondNode = _CondAtom | _CondOp
 
 
 # One bl source file's properties stored in the manifest
@@ -177,6 +191,14 @@ class _BlockOutput:
     lines: list[str] = field(default_factory=list[str])  # compiled mcfunction command lines
     macros: set[str] = field(default_factory=set[str])  # vanilla macros the block may use
     can_return: bool = False  # whether the block may early-return
+
+
+# if/elif condition compiled to execute subcommands
+class _CompiledCondition(NamedTuple):
+    setup_lines: list[_Line]  # run immediately before testing `subcommands`
+    subcommands: str  # e.g. "if score @s v matches 1 unless function pack:f_helper/cond_0"
+    report_error_command: str | None  # run if the cond holder reports a macro substitution failure
+    macros: set[str]  # macros referenced by `setup_lines` and `subcommands`
 
 
 # The `bl` object exposed inside python blocks
@@ -636,6 +658,12 @@ class Compile:
     _BL_RETURNING_HOLDER = "#_bl_returning"
     _BL_SUCCESS_HOLDER = "#_bl_return_success"
     _BL_VALUE_HOLDER = "#_bl_return_value"
+    _BL_COND_HOLDER = "#_bl_cond"  # 2 = macro substitution failed (preset), 1 = true, 0 = false
+
+    # ----- Conditions ----- #
+    _BL_DEBUG_TAG = "_bl_debug"  # players with this tag see runtime errors
+    _COND_MAX_CLAUSES = 64  # max clauses from distributing macro-bearing 'or'
+    _COND_OPERATORS = frozenset(("and", "or", "not"))
 
     # ----- Compiled output strings ----- #
     HEADER_MARKER = "Compiled by Blocklight"
@@ -748,6 +776,17 @@ class Compile:
     def _header_lines(local_path: str, lineno: int) -> list[str]:
         return [*Compile._HEADER_TEXT, f"#     `{local_path}:{lineno}`"]
 
+    # Write `block_out` as the output file of `function_name`.
+    @staticmethod
+    def _write_function(function_name: str, block_out: _BlockOutput, line: _Line, local_path: str) -> None:
+        orchestration.write_output_file(
+            Compile._function_filepath(function_name),
+            "\n".join(block_out.lines),
+            line,
+            local_path,
+            function_name.split(":", 1)[0],
+        )
+
     # Validate a function header and compile its body to an mcfunction file.
     def _compile_function(self, sf: SourceFile, lines: list[_Line]) -> None:
         header = lines[0]
@@ -804,7 +843,7 @@ class Compile:
             )
 
         # Write output file to disk
-        orchestration.write_output_file(output_filepath, "\n".join(block_out.lines), header, sf.local_path, namespace)
+        self._write_function(block_in.function_name, block_out, header, sf.local_path)
         if is_load:
             orchestration.register_load_function(output_filepath)
         if is_tick:
@@ -854,13 +893,7 @@ class Compile:
                         new_block_out = _BlockOutput()
                         new_block_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
                         self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
-                        orchestration.write_output_file(
-                            self._function_filepath(child_function_name),
-                            "\n".join(new_block_out.lines),
-                            line,
-                            block_in.sf.local_path,
-                            child_function_name.split(":", 1)[0],
-                        )
+                        self._write_function(child_function_name, new_block_out, line, block_in.sf.local_path)
 
                         # Determine what framework needs to be constructed around the child function call
                         macros_string = self._macros_with_clause(new_block_out.macros)  # Were macros used?
@@ -881,8 +914,8 @@ class Compile:
 
                     case _KeywordType.CONDITIONAL:
                         if keyword == "while":
-                            raise BLSyntaxError(f"The '{keyword}' block is not yet implemented.", line)
-                        if keyword == "if":
+                            self._compile_while(block_in, block_out, counts, args, span, depth)
+                        elif keyword == "if":
                             pending_chain = [(keyword, args, span)]
                         else:  # 'elif' or 'else', continuing the chain just closed above if unrelated
                             if not pending_chain:
@@ -922,13 +955,7 @@ class Compile:
                     child_block_out,
                     _Line(self._RET_SET_HOLDERS + return_command_tail, line.lineno),
                 )
-                orchestration.write_output_file(
-                    self._function_filepath(child_filepath),
-                    "\n".join(child_block_out.lines),
-                    line,
-                    block_in.sf.local_path,
-                    child_filepath.split(":", 1)[0],
-                )
+                self._write_function(child_filepath, child_block_out, line, block_in.sf.local_path)
 
                 # Call the helper inline, forcing return if it runs.
                 block_out.can_return = True
@@ -968,42 +995,41 @@ class Compile:
         if_line = chain[0][2][0]
 
         # Compile each branch's body recursively
-        branches: list[tuple[str, str, _BlockOutput]] = []  # (condition ('' for else), child_function_name, output)
+        branches: list[tuple[_CompiledCondition | None, str, _BlockOutput]] = []  # (None for else, name, output)
         elif_index = 0
         for keyword, args, span in chain:
             header_line = span[0]
+            cond: _CompiledCondition | None = None
             if keyword == "if":
                 branch_name = f"{chain_id}_if"
-                cond = self._parse_condition(args, header_line)
+                cond = self._compile_condition(block_in, counts, args, header_line)
             elif keyword == "elif":
                 branch_name = f"{chain_id}_elif_{elif_index}"
                 elif_index += 1
-                cond = self._parse_condition(args, header_line)
+                cond = self._compile_condition(block_in, counts, args, header_line)
             else:
                 branch_name = f"{chain_id}_else"
-                cond = ""
 
             child_function_name = f"{block_in.function_name}_helper/{branch_name}"
             new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
             new_block_out = _BlockOutput()
             new_block_out.lines.extend(self._header_lines(block_in.sf.local_path, header_line.lineno))
             self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
-            orchestration.write_output_file(
-                self._function_filepath(child_function_name),
-                "\n".join(new_block_out.lines),
-                header_line,
-                block_in.sf.local_path,
-                child_function_name.split(":", 1)[0],
-            )
+            self._write_function(child_function_name, new_block_out, header_line, block_in.sf.local_path)
             branches.append((cond, child_function_name, new_block_out))
 
         # Bare 'if' (single branch): call exactly like a modifier block, no dispatcher needed.
         if len(branches) == 1:
             cond, child_function_name, branch_out = branches[0]
+            assert cond is not None
+            for setup_line in cond.setup_lines:
+                self._append_line_to_block_out(block_out, setup_line)
+            if cond.report_error_command is not None:  # before the body, which may reuse the holder
+                block_out.lines.append(self._condition_error_line(cond.report_error_command, exit_function=False))
             macros_string = self._macros_with_clause(branch_out.macros)
             self._append_line_to_block_out(
                 block_out,
-                _Line(f"execute if {cond} run function {child_function_name}{macros_string}", if_line.lineno),
+                _Line(f"execute {cond.subcommands} run function {child_function_name}{macros_string}", if_line.lineno),
             )
             if branch_out.can_return:
                 block_out.can_return = True
@@ -1017,20 +1043,28 @@ class Compile:
         dispatcher_out.lines.extend(self._header_lines(block_in.sf.local_path, if_line.lineno))
         for cond, child_function_name, branch_out in branches:
             macros_string = self._macros_with_clause(branch_out.macros)
-            if cond:  # 'if' / 'elif': only run (and exit the dispatcher) if the condition matches
-                dispatcher_line = f"execute if {cond} run return run function {child_function_name}{macros_string}"
+            if cond is not None:  # 'if' / 'elif': only run (and exit the dispatcher) if the condition matches
+                for setup_line in cond.setup_lines:
+                    self._append_line_to_block_out(dispatcher_out, setup_line)
+                self._append_line_to_block_out(
+                    dispatcher_out,
+                    _Line(
+                        f"execute {cond.subcommands} run return run function {child_function_name}{macros_string}",
+                        if_line.lineno,
+                    ),
+                )
+                # Macro substitution failure aborts the chain, skipping 'else'
+                if cond.report_error_command is not None:
+                    dispatcher_out.lines.append(
+                        self._condition_error_line(cond.report_error_command, exit_function=True)
+                    )
             else:  # 'else': unconditional, always last
-                dispatcher_line = f"return run function {child_function_name}{macros_string}"
-            self._append_line_to_block_out(dispatcher_out, _Line(dispatcher_line, if_line.lineno))
+                self._append_line_to_block_out(
+                    dispatcher_out, _Line(f"return run function {child_function_name}{macros_string}", if_line.lineno)
+                )
             if branch_out.can_return:
                 dispatcher_out.can_return = True
-        orchestration.write_output_file(
-            self._function_filepath(dispatcher_function_name),
-            "\n".join(dispatcher_out.lines),
-            if_line,
-            block_in.sf.local_path,
-            dispatcher_function_name.split(":", 1)[0],
-        )
+        self._write_function(dispatcher_function_name, dispatcher_out, if_line, block_in.sf.local_path)
 
         # Call the dispatcher unconditionally; it already decided which branch (if any) matched.
         macros_string = self._macros_with_clause(dispatcher_out.macros)
@@ -1043,40 +1077,277 @@ class Compile:
             for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
                 block_out.lines.append(handler_string)
 
-    # Parse an if/elif condition: strip one fully-wrapping outer `(...)` pair (otherwise passed
-    # through unchanged), then reject unimplemented boolean composition.
-    @staticmethod
-    def _parse_condition(args: str, line: _Line) -> str:
-        cond = args
-        if len(cond) >= 2 and cond[0] == "(" and cond[-1] == ")":
-            paren_depth = 0
-            fully_wrapped = True
-            for i, ch in enumerate(cond):
-                if ch == "(":
-                    paren_depth += 1
-                elif ch == ")":
-                    paren_depth -= 1
-                    if paren_depth == 0 and i != len(cond) - 1:
-                        fully_wrapped = False
-                        break
-            if fully_wrapped:
-                cond = cond[1:-1]
+    # Compile a while loop: the head helper tests the condition and tail-calls the body, which tail-calls the head.
+    def _compile_while(self, block_in: _BlockInput, block_out: _BlockOutput, counts: dict[str, int], args: str,
+                       span: list[_Line], depth: int) -> None:
+        line = span[0]
+        loop_count = counts.get("while", 0)
+        counts["while"] = loop_count + 1
+        head_function_name = f"{block_in.function_name}_helper/while_{loop_count}"
+        body_function_name = f"{head_function_name}_body"
+        cond = self._compile_condition(block_in, counts, args, line)
 
-        composition_error = BLSyntaxError(
-            "Boolean composition ('and'/'or'/'not') in conditions is not yet implemented.", line
+        body_in = _BlockInput(block_in.sf, block_in.source_function_name, body_function_name)
+        body_out = _BlockOutput()
+        body_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
+        self._compile_lines(body_in, body_out, span[1:], depth + 1)
+        # Head and body call each other, so both forward the union of their macros
+        loop_macros_string = self._macros_with_clause(body_out.macros | cond.macros)
+        self._append_line_to_block_out(
+            body_out, _Line(f"return run function {head_function_name}{loop_macros_string}", line.lineno)
         )
-        if cond.startswith("!("):
-            raise composition_error
-        paren_depth = 0
-        for match in re.finditer(r"\(|\)|\band\b|\bor\b", cond):
-            token = match.group()
-            if token == "(":
-                paren_depth += 1
-            elif token == ")":
-                paren_depth -= 1
-            elif paren_depth == 0:
-                raise composition_error
-        return cond
+        self._write_function(body_function_name, body_out, line, block_in.sf.local_path)
+
+        head_out = _BlockOutput()
+        head_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
+        for setup_line in cond.setup_lines:
+            self._append_line_to_block_out(head_out, setup_line)
+        self._append_line_to_block_out(
+            head_out,
+            _Line(
+                f"execute {cond.subcommands} run return run function {body_function_name}{loop_macros_string}",
+                line.lineno,
+            ),
+        )
+        if cond.report_error_command is not None:
+            head_out.lines.append(self._condition_error_line(cond.report_error_command, exit_function=False))
+        self._write_function(head_function_name, head_out, line, block_in.sf.local_path)
+
+        self._append_line_to_block_out(
+            block_out, _Line(f"function {head_function_name}{self._macros_with_clause(head_out.macros)}", line.lineno)
+        )
+        if body_out.can_return:
+            block_out.can_return = True
+            for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
+                block_out.lines.append(handler_string)
+
+    # Compile an if/elif condition to execute subcommands.
+    def _compile_condition(self, block_in: _BlockInput, counts: dict[str, int], args: str, 
+                           line: _Line) -> _CompiledCondition:
+        node = self._normalize_condition(self._parse_condition(args, line))
+        or_functions: dict[_CondOp, str] = {}
+        if not self._condition_has_macro_or(node):
+            subcommands = self._condition_subcommands(block_in, counts, or_functions, node, line)
+            macros = set(self._iter_macro_names(_Line(subcommands, line.lineno)))
+            return _CompiledCondition([], subcommands, None, macros)
+
+        clauses = self._condition_clauses(node)
+        if len(clauses) > self._COND_MAX_CLAUSES:
+            raise BLSyntaxError(
+                f"This condition expands to {len(clauses)} clauses (max {self._COND_MAX_CLAUSES}) because of macros "
+                "inside 'or'. Simplify it or move the macros out of the 'or'.",
+                line,
+            )
+        cond_function_name, cond_out = self._write_condition_function(block_in, counts, or_functions, clauses, line)
+        holder = f"{self._BL_COND_HOLDER} {self._BL_RESERVED_SCOREBOARD}"
+        macros_string = self._macros_with_clause(cond_out.macros)
+        message = f"[Blocklight] Macro substitution failed in condition at {block_in.sf.local_path}:{line.lineno}"
+        return _CompiledCondition(
+            [
+                _Line(f"scoreboard players set {holder} 2", line.lineno),
+                _Line(
+                    f"execute store result score {holder} run function {cond_function_name}{macros_string}",
+                    line.lineno,
+                ),
+            ],
+            f"if score {holder} matches 1",
+            f"tellraw @a[tag={self._BL_DEBUG_TAG}] {json.dumps({'text': message, 'color': 'red'})}",
+            cond_out.macros,
+        )
+
+    # Report a macro substitution failure recorded in the cond holder, optionally returning.
+    def _condition_error_line(self, report_error_command: str, exit_function: bool) -> str:
+        return_prefix = "return run " if exit_function else ""
+        return (
+            f"execute if score {self._BL_COND_HOLDER} {self._BL_RESERVED_SCOREBOARD} matches 2 "
+            f"run {return_prefix}{report_error_command}"
+        )
+
+    # Execute subcommands testing a normalized condition. Writes one helper per distinct 'or' node (`or_functions`).
+    def _condition_subcommands(self, block_in: _BlockInput, counts: dict[str, int], or_functions: dict[_CondOp, str],
+                               node: _CondNode, line: _Line) -> str:
+        if isinstance(node, _CondAtom):
+            return f"{'unless' if node.negated else 'if'} {node.text}"
+        if node.op == "and":
+            return " ".join(
+                self._condition_subcommands(block_in, counts, or_functions, term, line) for term in node.terms
+            )
+        if node not in or_functions:
+            or_functions[node], _cond_out = self._write_condition_function(
+                block_in, counts, or_functions, [[term] for term in node.terms], line
+            )
+        return f"if function {or_functions[node]}"
+
+    # Write a helper returning 1 if any clause (conjunction of terms) matches, else 0.
+    def _write_condition_function(self, block_in: _BlockInput, counts: dict[str, int], 
+                                  or_functions: dict[_CondOp, str], clauses: list[list[_CondNode]], line: _Line,
+                                  ) -> tuple[str, _BlockOutput]:
+        cond_count = counts.get("cond", 0)
+        counts["cond"] = cond_count + 1
+        cond_function_name = f"{block_in.function_name}_helper/cond_{cond_count}"
+        cond_out = _BlockOutput()
+        cond_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
+        for clause in clauses:
+            subcommands = " ".join(
+                self._condition_subcommands(block_in, counts, or_functions, term, line) for term in clause
+            )
+            self._append_line_to_block_out(cond_out, _Line(f"execute {subcommands} run return 1", line.lineno))
+        cond_out.lines.append("return 0")
+        self._write_function(cond_function_name, cond_out, line, block_in.sf.local_path)
+        return cond_function_name, cond_out
+
+    # Distribute 'and' over macro-bearing 'or' nodes, giving clauses in order. Macro-free subtrees stay whole.
+    @staticmethod
+    def _condition_clauses(node: _CondNode) -> list[list[_CondNode]]:
+        if isinstance(node, _CondAtom) or not Compile._condition_has_macro(node):
+            return [[node]]
+        if node.op == "or":
+            return [clause for term in node.terms for clause in Compile._condition_clauses(term)]
+        clauses: list[list[_CondNode]] = [[]]
+        for term in node.terms:
+            clauses = [clause + term_clause for clause in clauses for term_clause in Compile._condition_clauses(term)]
+        return clauses
+
+    @staticmethod
+    def _condition_has_macro(node: _CondNode) -> bool:
+        if isinstance(node, _CondAtom):
+            return "$(" in node.text
+        return any(Compile._condition_has_macro(term) for term in node.terms)
+
+    # Whether any 'or' node references a macro.
+    @staticmethod
+    def _condition_has_macro_or(node: _CondNode) -> bool:
+        if isinstance(node, _CondAtom):
+            return False
+        if node.op == "or" and Compile._condition_has_macro(node):
+            return True
+        return any(Compile._condition_has_macro_or(term) for term in node.terms)
+
+    # Push 'not' down to atoms using De Morgan's law and flatten nested same-operator nodes.
+    @staticmethod
+    def _normalize_condition(node: _CondNode, negate: bool = False) -> _CondNode:
+        if isinstance(node, _CondAtom):
+            return node._replace(negated=node.negated != negate)
+        if node.op == "not":
+            return Compile._normalize_condition(node.terms[0], not negate)
+        op = {"and": "or", "or": "and"}[node.op] if negate else node.op
+        terms: list[_CondNode] = []
+        for term in node.terms:
+            normalized = Compile._normalize_condition(term, negate)
+            if isinstance(normalized, _CondOp) and normalized.op == op:
+                terms.extend(normalized.terms)
+            else:
+                terms.append(normalized)
+        return _CondOp(op, tuple(terms))
+
+    # Parse an if/elif condition into a tree. Precedence: 'not' > 'and' > 'or'.
+    @staticmethod
+    def _parse_condition(args: str, line: _Line) -> _CondNode:
+        def parse_binary(op: str, parse_term: Callable[[], _CondNode]) -> _CondNode:
+            nonlocal pos
+            terms = [parse_term()]
+            while pos < len(tokens) and tokens[pos][0] == op:
+                pos += 1
+                terms.append(parse_term())
+            return terms[0] if len(terms) == 1 else _CondOp(op, tuple(terms))
+
+        def parse_or() -> _CondNode:
+            return parse_binary("or", parse_and)
+
+        def parse_and() -> _CondNode:
+            return parse_binary("and", parse_not)
+
+        def parse_not() -> _CondNode:
+            nonlocal pos
+            kind = tokens[pos][0] if pos < len(tokens) else ""
+            if kind == "not":
+                pos += 1
+                return _CondOp("not", (parse_not(),))
+            if kind == "(":
+                pos += 1
+                node = parse_or()
+                if pos >= len(tokens):
+                    raise BLSyntaxError("This condition is missing a closing ')'.", line)
+                if tokens[pos][0] != ")":
+                    raise BLSyntaxError(f"This condition expected ')' but found '{tokens[pos][1]}'.", line)
+                pos += 1
+                return node
+            if kind == "atom":
+                pos += 1
+                return _CondAtom(tokens[pos - 1][1])
+            if pos >= len(tokens):
+                raise BLSyntaxError("This condition ends where a condition was expected.", line)
+            raise BLSyntaxError(f"This condition expected a condition but found '{tokens[pos][1]}'.", line)
+
+        tokens = Compile._tokenize_condition(args, line)
+        pos = 0
+        node = parse_or()
+        if pos < len(tokens):
+            raise BLSyntaxError(
+                f"This condition has an unexpected '{tokens[pos][1]}'. Join conditions with 'and' or 'or'.", line
+            )
+        return node
+
+    # Split a condition into (kind, text) tokens of kind "(", ")", "and", "or", "not" or "atom".
+    # Brackets, braces, quoted strings and `$(macro)` references stay intact inside atoms.
+    @staticmethod
+    def _tokenize_condition(cond: str, line: _Line) -> list[tuple[str, str]]:
+        def flush(end: int) -> None:
+            text = cond[atom_start:end].strip()
+            if text:
+                tokens.append(("atom", text))
+
+        def is_boundary(index: int) -> bool:
+            return index < 0 or index >= len(cond) or cond[index].isspace() or cond[index] in "()"
+
+        tokens: list[tuple[str, str]] = []
+        closers: list[str] = []  # expected closers for open '[' / '{'
+        atom_start = 0
+        i = 0
+        while i < len(cond):
+            ch = cond[i]
+            if ch in "\"'":  # skip quoted string
+                end = i + 1
+                while end < len(cond) and cond[end] != ch:
+                    end += 2 if cond[end] == "\\" else 1
+                if end >= len(cond):
+                    raise BLSyntaxError("This condition has an unterminated string.", line)
+                i = end + 1
+                continue
+            if ch in "[{":
+                closers.append("]" if ch == "[" else "}")
+            elif ch in "]}":
+                if not closers or closers.pop() != ch:
+                    raise BLSyntaxError(f"This condition has an unmatched '{ch}'.", line)
+            elif closers:
+                pass
+            elif cond.startswith("$(", i):  # macro reference stays in the atom
+                end = cond.find(")", i)
+                i = len(cond) if end == -1 else end + 1
+                continue
+            elif ch in "()":
+                flush(i)
+                tokens.append((ch, ch))
+                atom_start = i + 1
+            else:
+                for op in Compile._COND_OPERATORS:
+                    if not (cond.startswith(op, i) and is_boundary(i - 1) and is_boundary(i + len(op))):
+                        continue
+                    if op == "not" and cond[atom_start:i].strip():  # unary: only where an operand begins
+                        continue
+                    flush(i)
+                    tokens.append((op, op))
+                    i += len(op)
+                    atom_start = i
+                    break
+                else:
+                    i += 1
+                continue
+            i += 1
+        if closers:
+            raise BLSyntaxError(f"This condition is missing a closing '{closers[-1]}'.", line)
+        flush(len(cond))
+        return tokens
 
     @staticmethod
     def _append_line_to_block_out(block_out: _BlockOutput, line: _Line) -> None:
