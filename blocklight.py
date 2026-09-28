@@ -6,6 +6,7 @@ import enum
 import hashlib
 import json
 import os
+import stat
 import string
 import sys
 import textwrap
@@ -14,7 +15,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import ClassVar, NamedTuple, cast
+from typing import IO, ClassVar, NamedTuple, cast
 
 # ----- Tweakable constants ----- #
 _BL_VERSION = (1, 0)
@@ -25,6 +26,7 @@ _FILE_WRITE_WORKERS_COUNT = 8
 # ----- Compiler internal constants ----- #
 _BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # Windows junction; stat only defines it on Windows
 
 
 # ----- Keywords ----- #
@@ -116,6 +118,51 @@ class BLPythonError(BLNonFatalError):  # Raised while compiling a python: block.
     pass
 
 
+# Whether `path` itself is a symlink or Windows junction, without following it.
+def _is_link(path: str) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+
+
+# First component of `path` (walked from the working directory, or root if absolute) that is a
+# symlink or junction, else None. Components are checked as written so '..' cannot hide one.
+def _find_link(path: str) -> str | None:
+    if os.altsep:
+        path = path.replace(os.altsep, os.sep)
+    drive, rest = os.path.splitdrive(path)
+    prefix = drive + (os.sep if rest.startswith(os.sep) else "")
+    for part in rest.split(os.sep):
+        if part in ("", "."):
+            continue
+        prefix = os.path.join(prefix, part) if prefix else part
+        if _is_link(prefix):
+            return prefix
+        if not os.path.lexists(prefix):
+            return None  # nothing further along exists to follow
+    return None
+
+
+# With --no-symlink, an error if reaching `path` would pass through a symlink, else None.
+def _symlink_refusal(path: str, action: str) -> BLFileError | None:
+    if not tui.get_no_symlink():
+        return None
+    link = _find_link(path)
+    if link is None:
+        return None
+    via = "" if link == os.path.normpath(path) else f" through symlink '{link}'"
+    return BLFileError(f"Refusing to {action} '{path}'{via} (--no-symlink is set).")
+
+
+# open() that, with --no-symlink, fails instead of following a symlink at the final path component.
+# Closes the gap between a _symlink_refusal check and the open itself. No-op where O_NOFOLLOW is missing.
+def _open(path: str, mode: str = "r") -> IO[str]:
+    no_follow = getattr(os, "O_NOFOLLOW", 0) if tui.get_no_symlink() else 0
+    return open(path, mode, encoding="utf-8", opener=lambda p, flags: os.open(p, flags | no_follow))
+
+
 # Contents and metadata surrounding a bl source file. Reads file from disk on init.
 @dataclass
 class SourceFile:
@@ -126,7 +173,7 @@ class SourceFile:
     # Opens, reads, and cleans the source file. Logs and raises BLFileError on failure.
     def __post_init__(self) -> None:
         try:
-            with open(self.local_path, encoding="utf-8") as f:
+            with _open(self.local_path) as f:
                 self.source_lines = list(self._iter_clean_lines(enumerate(f, start=1)))
         except (OSError, UnicodeDecodeError) as err:
             detail = err.strerror if isinstance(err, OSError) and err.strerror else str(err)
@@ -215,12 +262,13 @@ class _PythonBlockContext:
         self.BLOCKLIGHT_VERSION = _BL_VERSION_STRING
 
 
-# Parses CLI args and drives user-facing progress UI
+# Parses CLI args, collects errors and write/skip counts, and reports them on stderr.
+# Error logging and counters are thread safe.
 class TUI:
     def __init__(self) -> None:
         self._options = CompilerOptions()
         self._errors: list[BLError] = []
-        self._lock = threading.Lock()  # guards _errors and the three tick counters below
+        self._lock = threading.Lock()  # guards _errors, _written and _skipped
         self._written = 0
         self._skipped = 0
         self._start_time = 0.0
@@ -276,18 +324,17 @@ class TUI:
     def get_force(self) -> bool:
         return self._options.force
 
-    # Thread safe
     def log_error(self, error: BLError) -> None:
+        # Write under the lock so concurrent errors print whole and in the same order as _errors.
         with self._lock:
             self._errors.append(error)
-        self.print(f"{type(error).__name__}: {error}")
+            sys.stderr.write(f"{type(error).__name__}: {error}\n")
+            sys.stderr.flush()
 
-    # Thread safe
     def get_errors(self) -> list[BLError]:
         with self._lock:
             return list(self._errors)
 
-    # Thread safe
     def tick_written(self) -> None:
         with self._lock:
             self._written += 1
@@ -296,24 +343,20 @@ class TUI:
         with self._lock:
             self._skipped += 1
 
-    # Starts the compile clock and the live footer (if tty).
+    # Starts the compile clock.
     def start(self) -> None:
         self._start_time = time.monotonic()
 
-    # Prints a line of output, keeping the footer pinned to the bottom line.
-    def print(self, message: str) -> None:
-        sys.stderr.write(message + "\n")
-        sys.stderr.flush()
-
-    # Stops the footer (if running) and prints the final summary
+    # Prints the final compile summary
     def finish(self) -> None:
         elapsed = time.monotonic() - self._start_time
         summary = (
-            f"Compiled {orchestration.get_pack_name()} in {elapsed:.3f} seconds. [{self._written} written / {self._skipped} skipped]"
+            f"Compiled {orchestration.get_pack_name()} in {elapsed:.3f} seconds."
+            f" [{self._written} written / {self._skipped} skipped]"
         )
         if self._errors:
             summary += " (see above for errors)"
-        self.print(summary)
+        print(summary)
 
 
 # Owns pack.mcmeta/manifest state, discovery, both thread pools, and every datapack-level
@@ -391,9 +434,7 @@ class Orchestration:
     def write_output_file(
         self, filepath: str, contents: str, function_def_line: _Line, local_path: str, namespace: str
     ) -> None:
-        expected_root = os.path.normpath(f"data/{namespace}/function")
-        normalized = os.path.normpath(filepath)
-        if normalized != expected_root and not normalized.startswith(expected_root + os.sep):
+        if not self._in_function_dir(filepath, namespace):
             err = BLFileError(f"Output path '{filepath}' escapes namespace '{namespace}'.", function_def_line)
             self.report_error(local_path, err)
             return
@@ -408,15 +449,24 @@ class Orchestration:
     def wait_for_writes(self) -> None:
         self._write_executor.shutdown(wait=True)
 
-    # Delete one stale output file.
-    # Does not delete anything missing the Blocklight header.
+    # Delete one stale output file. Paths come from the manifest, so they are untrusted: only deletes
+    # a .mcfunction inside data/<namespace>/function of the source's namespace, carrying the Blocklight header.
     def delete_stale_output(self, filepath: str, local_path: str) -> None:
+        parts = os.path.normpath(local_path).split(os.sep)
+        namespace = parts[1] if len(parts) > 3 and parts[0] == "data" and parts[2] == "blocklight" else ""
+        if not filepath.endswith(".mcfunction") or not self._in_function_dir(filepath, namespace):
+            error = BLFileError(f"Refusing to delete '{filepath}': not an output file of '{local_path}'.")
+            self.report_error(local_path, error)
+            return
+        if refusal := _symlink_refusal(filepath, "delete stale file"):
+            self.report_error(local_path, refusal)
+            return
         if not os.path.isfile(filepath):
             return
 
         # Verify header
         try:
-            with open(filepath, encoding="utf-8") as f:
+            with _open(filepath) as f:
                 content = f.read()
         except OSError as err:
             error = BLFileError(f"Failed to verify '{filepath}' before deleting: {err.strerror}.")
@@ -437,9 +487,11 @@ class Orchestration:
     # Locate pack.mcmeta and every .bl file under data/<namespace>/blocklight/, compiling each
     # concurrently, then write the manifest.
     def run(self) -> None:
+        if refusal := _symlink_refusal("pack.mcmeta", "read"):
+            raise SystemExit(str(refusal))
         if not os.path.isfile("pack.mcmeta"):
             raise SystemExit("No pack.mcmeta found in the current directory.")
-        with open("pack.mcmeta", encoding="utf-8") as f:
+        with _open("pack.mcmeta") as f:
             try:
                 pack_meta: dict[str, object] = json.load(f)
             except json.JSONDecodeError as err:
@@ -452,6 +504,9 @@ class Orchestration:
                 BLSyntaxError(f"The datapack directory name '{self._pack_name}' may only use a-z, 0-9, '_' and '-'.")
             )
 
+        if refusal := _symlink_refusal("data", "read"):
+            tui.log_error(refusal)
+            return
         if not os.path.isdir("data"):
             return
 
@@ -460,6 +515,9 @@ class Orchestration:
         discovered: dict[str, str] = {}  # local_path -> namespace
         for namespace in sorted(os.listdir("data")):
             namespace_dir = os.path.join("data", namespace)
+            if refusal := _symlink_refusal(namespace_dir, "read namespace"):
+                tui.log_error(refusal)
+                continue
             if not os.path.isdir(namespace_dir):
                 continue
             if set(namespace) - _FUNCTION_NAME_CHARS:
@@ -493,9 +551,13 @@ class Orchestration:
 
     # Writes output file to disk.
     def _persist_file(self, filepath: str, contents: str, function_def_line: _Line, local_path: str) -> None:
+        if refusal := _symlink_refusal(filepath, "write"):
+            refusal.lineno, refusal.text = function_def_line.lineno, function_def_line.text
+            self.report_error(local_path, refusal)
+            return
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            with open(filepath, "x", encoding="utf-8") as f:
+            with _open(filepath, "x") as f:
                 f.write(contents)
         except FileExistsError:
             err = BLFileError(f"Another function already compiles to '{filepath}'.", function_def_line)
@@ -547,6 +609,15 @@ class Orchestration:
                 return (cast(int, parts[0]), cast(int, parts[1]))
         return (0, 0)
 
+    # Whether `filepath` normalizes to a path inside data/<namespace>/function. Rejects malformed namespaces.
+    @staticmethod
+    def _in_function_dir(filepath: str, namespace: str) -> bool:
+        if not namespace or set(namespace) - _FUNCTION_NAME_CHARS:
+            return False
+        expected_root = os.path.normpath(f"data/{namespace}/function")
+        normalized = os.path.normpath(filepath)
+        return normalized == expected_root or normalized.startswith(expected_root + os.sep)
+
     # Convert "data/<namespace>/function/<filepath_remainder>.mcfunction" to "<namespace>:<filepath_remainder>"
     @staticmethod
     def _function_id(filepath: str) -> str:
@@ -555,8 +626,11 @@ class Orchestration:
 
     # Load the previous run's manifest, if any. A missing or corrupt manifest is treated as empty.
     def _read_manifest(self) -> _Manifest | None:
+        if refusal := _symlink_refusal(self._MANIFEST_FILENAME, "read manifest"):
+            tui.log_error(refusal)
+            return None
         try:
-            with open(self._MANIFEST_FILENAME, encoding="utf-8") as f:
+            with _open(self._MANIFEST_FILENAME) as f:
                 raw: object = json.load(f)
         except (OSError, json.JSONDecodeError):
             return None
@@ -599,21 +673,27 @@ class Orchestration:
                 for local_path, content_hash in self._source_hashes.items()
             },
         }
-        with open(self._MANIFEST_FILENAME, "w", encoding="utf-8") as f:
+        if refusal := _symlink_refusal(self._MANIFEST_FILENAME, "write manifest"):
+            tui.log_error(refusal)
+            return
+        with _open(self._MANIFEST_FILENAME, "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
 
     # Yield .bl paths under blocklight_dir. With no_symlink, refuses to follow symlinked
     # directories or read symlinked files, logging a recoverable error for each one skipped.
     def _iter_bl_files(self, blocklight_dir: str) -> Iterator[str]:
         no_symlink = tui.get_no_symlink()
+        if refusal := _symlink_refusal(blocklight_dir, "read"):  # os.walk follows a symlinked top regardless
+            tui.log_error(refusal)
+            return
         for root, dirs, files in os.walk(blocklight_dir, followlinks=not no_symlink):
             if no_symlink:
                 kept_dirs: list[str] = []
                 for d in dirs:
                     full = os.path.join(root, d)
-                    if os.path.islink(full):
+                    if _is_link(full):
                         tui.log_error(
-                            BLSyntaxError(f"Refusing to follow symlinked directory '{full}' (--no-symlink is set).")
+                            BLFileError(f"Refusing to follow symlinked directory '{full}' (--no-symlink is set).")
                         )
                     else:
                         kept_dirs.append(d)
@@ -623,9 +703,9 @@ class Orchestration:
                 if not name.endswith(".bl"):
                     continue
                 path = os.path.join(root, name)
-                if no_symlink and os.path.islink(path):
+                if no_symlink and _is_link(path):
                     tui.log_error(
-                        BLSyntaxError(f"Refusing to read symlinked source file '{path}' (--no-symlink is set).")
+                        BLFileError(f"Refusing to read symlinked source file '{path}' (--no-symlink is set).")
                     )
                     continue
                 yield path
@@ -988,8 +1068,14 @@ class Compile:
             self._compile_if_chain(block_in, block_out, counts, pending_chain, depth)
 
     # Compile one if-elif-else chain
-    def _compile_if_chain(self, block_in: _BlockInput, block_out: _BlockOutput, counts: dict[str, int],
-                          chain: list[tuple[str, str, list[_Line]]], depth: int) -> None:
+    def _compile_if_chain(
+        self,
+        block_in: _BlockInput,
+        block_out: _BlockOutput,
+        counts: dict[str, int],
+        chain: list[tuple[str, str, list[_Line]]],
+        depth: int,
+    ) -> None:
         chain_id = f"chain_{counts.get('if', 0)}"
         counts["if"] = counts.get("if", 0) + 1
         if_line = chain[0][2][0]
@@ -1078,8 +1164,15 @@ class Compile:
                 block_out.lines.append(handler_string)
 
     # Compile a while loop: the head helper tests the condition and tail-calls the body, which tail-calls the head.
-    def _compile_while(self, block_in: _BlockInput, block_out: _BlockOutput, counts: dict[str, int], args: str,
-                       span: list[_Line], depth: int) -> None:
+    def _compile_while(
+        self,
+        block_in: _BlockInput,
+        block_out: _BlockOutput,
+        counts: dict[str, int],
+        args: str,
+        span: list[_Line],
+        depth: int,
+    ) -> None:
         line = span[0]
         loop_count = counts.get("while", 0)
         counts["while"] = loop_count + 1
@@ -1122,8 +1215,9 @@ class Compile:
                 block_out.lines.append(handler_string)
 
     # Compile an if/elif condition to execute subcommands.
-    def _compile_condition(self, block_in: _BlockInput, counts: dict[str, int], args: str, 
-                           line: _Line) -> _CompiledCondition:
+    def _compile_condition(
+        self, block_in: _BlockInput, counts: dict[str, int], args: str, line: _Line
+    ) -> _CompiledCondition:
         node = self._normalize_condition(self._parse_condition(args, line))
         or_functions: dict[_CondOp, str] = {}
         if not self._condition_has_macro_or(node):
@@ -1164,8 +1258,14 @@ class Compile:
         )
 
     # Execute subcommands testing a normalized condition. Writes one helper per distinct 'or' node (`or_functions`).
-    def _condition_subcommands(self, block_in: _BlockInput, counts: dict[str, int], or_functions: dict[_CondOp, str],
-                               node: _CondNode, line: _Line) -> str:
+    def _condition_subcommands(
+        self,
+        block_in: _BlockInput,
+        counts: dict[str, int],
+        or_functions: dict[_CondOp, str],
+        node: _CondNode,
+        line: _Line,
+    ) -> str:
         if isinstance(node, _CondAtom):
             return f"{'unless' if node.negated else 'if'} {node.text}"
         if node.op == "and":
@@ -1179,9 +1279,14 @@ class Compile:
         return f"if function {or_functions[node]}"
 
     # Write a helper returning 1 if any clause (conjunction of terms) matches, else 0.
-    def _write_condition_function(self, block_in: _BlockInput, counts: dict[str, int], 
-                                  or_functions: dict[_CondOp, str], clauses: list[list[_CondNode]], line: _Line,
-                                  ) -> tuple[str, _BlockOutput]:
+    def _write_condition_function(
+        self,
+        block_in: _BlockInput,
+        counts: dict[str, int],
+        or_functions: dict[_CondOp, str],
+        clauses: list[list[_CondNode]],
+        line: _Line,
+    ) -> tuple[str, _BlockOutput]:
         cond_count = counts.get("cond", 0)
         counts["cond"] = cond_count + 1
         cond_function_name = f"{block_in.function_name}_helper/cond_{cond_count}"

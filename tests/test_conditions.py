@@ -69,7 +69,7 @@ def test_condition_combination(index: int) -> None:
     expr = EXPRESSIONS[index]
     pack = _pack()
     for inputs in _INPUTS:
-        values = dict(zip(_PARAMS, inputs))
+        values = dict(zip(_PARAMS, inputs, strict=True))
         expected = eval(expr.format(**values))  # Python shares Blocklight's precedence: not > and > or
         scores = {(f"#{p}", "v"): int(value) for p, value in values.items()}
         for macro in (False, True):
