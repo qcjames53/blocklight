@@ -134,7 +134,7 @@ def test_macro_substitution_and_missing_arguments_fail_the_call():
     m = machine({"t:f": ["say plain", "$say $(a) $(b)"]})
     assert m.run('function t:f {a: "x", b: 2}') is None
     assert m.run("function t:f") == Result(False, 0)
-    assert m.run('function t:f with {a: "x"}') == Result(False, 0)
+    assert m.run('function t:f {a: "x"}') == Result(False, 0)
     assert [msg.text for msg in m.messages] == ["plain", "x 2"]
 
 

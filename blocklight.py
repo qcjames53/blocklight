@@ -896,7 +896,7 @@ class Compile:
                         self._write_function(child_function_name, new_block_out, line, block_in.sf.local_path)
 
                         # Determine what framework needs to be constructed around the child function call
-                        macros_string = self._macros_with_clause(new_block_out.macros)  # Were macros used?
+                        macros_string = self._macros_forwarder(new_block_out.macros)  # Were macros used?
                         self._append_line_to_block_out(
                             block_out,
                             _Line(
@@ -959,7 +959,7 @@ class Compile:
 
                 # Call the helper inline, forcing return if it runs.
                 block_out.can_return = True
-                macros_string = self._macros_with_clause(child_block_out.macros)
+                macros_string = self._macros_forwarder(child_block_out.macros)
                 self._append_line_to_block_out(
                     block_out,
                     _Line(
@@ -1026,7 +1026,7 @@ class Compile:
                 self._append_line_to_block_out(block_out, setup_line)
             if cond.report_error_command is not None:  # before the body, which may reuse the holder
                 block_out.lines.append(self._condition_error_line(cond.report_error_command, exit_function=False))
-            macros_string = self._macros_with_clause(branch_out.macros)
+            macros_string = self._macros_forwarder(branch_out.macros)
             self._append_line_to_block_out(
                 block_out,
                 _Line(f"execute {cond.subcommands} run function {child_function_name}{macros_string}", if_line.lineno),
@@ -1042,7 +1042,7 @@ class Compile:
         dispatcher_out = _BlockOutput()
         dispatcher_out.lines.extend(self._header_lines(block_in.sf.local_path, if_line.lineno))
         for cond, child_function_name, branch_out in branches:
-            macros_string = self._macros_with_clause(branch_out.macros)
+            macros_string = self._macros_forwarder(branch_out.macros)
             if cond is not None:  # 'if' / 'elif': only run (and exit the dispatcher) if the condition matches
                 for setup_line in cond.setup_lines:
                     self._append_line_to_block_out(dispatcher_out, setup_line)
@@ -1067,7 +1067,7 @@ class Compile:
         self._write_function(dispatcher_function_name, dispatcher_out, if_line, block_in.sf.local_path)
 
         # Call the dispatcher unconditionally; it already decided which branch (if any) matched.
-        macros_string = self._macros_with_clause(dispatcher_out.macros)
+        macros_string = self._macros_forwarder(dispatcher_out.macros)
         self._append_line_to_block_out(
             block_out,
             _Line(f"function {dispatcher_function_name}{macros_string}", if_line.lineno),
@@ -1092,7 +1092,7 @@ class Compile:
         body_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
         self._compile_lines(body_in, body_out, span[1:], depth + 1)
         # Head and body call each other, so both forward the union of their macros
-        loop_macros_string = self._macros_with_clause(body_out.macros | cond.macros)
+        loop_macros_string = self._macros_forwarder(body_out.macros | cond.macros)
         self._append_line_to_block_out(
             body_out, _Line(f"return run function {head_function_name}{loop_macros_string}", line.lineno)
         )
@@ -1114,7 +1114,7 @@ class Compile:
         self._write_function(head_function_name, head_out, line, block_in.sf.local_path)
 
         self._append_line_to_block_out(
-            block_out, _Line(f"function {head_function_name}{self._macros_with_clause(head_out.macros)}", line.lineno)
+            block_out, _Line(f"function {head_function_name}{self._macros_forwarder(head_out.macros)}", line.lineno)
         )
         if body_out.can_return:
             block_out.can_return = True
@@ -1140,7 +1140,7 @@ class Compile:
             )
         cond_function_name, cond_out = self._write_condition_function(block_in, counts, or_functions, clauses, line)
         holder = f"{self._BL_COND_HOLDER} {self._BL_RESERVED_SCOREBOARD}"
-        macros_string = self._macros_with_clause(cond_out.macros)
+        macros_string = self._macros_forwarder(cond_out.macros)
         message = f"[Blocklight] Macro substitution failed in condition at {block_in.sf.local_path}:{line.lineno}"
         return _CompiledCondition(
             [
@@ -1362,14 +1362,14 @@ class Compile:
             raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
         block_out.lines.append("$" + text if not has_macro_dollar and uses_macros else text)
 
-    # Build a vanilla `with {...}` clause forwarding each of `macros` from the current function's
+    # Build a vanilla `{...}` clause forwarding each of `macros` from the current function's
     # own macro arguments into the function being called.
     @staticmethod
-    def _macros_with_clause(macros: set[str]) -> str:
+    def _macros_forwarder(macros: set[str]) -> str:
         if not macros:
             return ""
         macro_args = ", ".join(f'"{m}": "$({m})"' for m in sorted(macros))
-        return f" with {{{macro_args}}}"
+        return f" {{{macro_args}}}"
 
     # Yield the name inside each vanilla macro '$(name)' in line, left to right.
     @staticmethod

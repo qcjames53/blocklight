@@ -365,9 +365,7 @@ class Machine:
         reader = _Reader(rest)
         function_id = reader.token()
         if reader.peek() == "with":
-            reader.token()
-            if reader.peek() != "" and not reader.peek().startswith("{"):
-                raise McrtError(f"Only inline 'with {{...}}' macro arguments are supported: 'function {rest}'")
+            raise McrtError(f"Only inline '{{...}}' macro arguments are supported: 'function {rest}'")
         if reader.done():
             return function_id, None
         args = parse_snbt(reader.rest())

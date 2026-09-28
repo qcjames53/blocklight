@@ -22,7 +22,8 @@ function fizzbuzz
         scoreboard players add #i example_var 1
 
 function fizzbuzz_runner
-    function bl_example:fizzbuzz/fizzbuzz with { \
+    scoreboard objectives add example_var dummy
+    function bl_example:fizzbuzz/fizzbuzz { \
         "max": 20, \
         "string_a": "Fizz", \
         "string_b": "Buzz", \
