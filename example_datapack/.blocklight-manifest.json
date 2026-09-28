@@ -1,0 +1,81 @@
+{
+  "load": [
+    "bl_example:functions/hello_load",
+    "bl_example:hello_universe"
+  ],
+  "sources": {
+    "data/bl_example/blocklight/binary_search.bl": {
+      "needs_recompile": false,
+      "outputs": [
+        "data/bl_example/function/binary_search/ocean_floor_height.mcfunction",
+        "data/bl_example/function/binary_search/ocean_floor_height_helper/chain_0_if.mcfunction",
+        "data/bl_example/function/binary_search/ocean_floor_height_helper/positioned_0.mcfunction",
+        "data/bl_example/function/binary_search/ocean_floor_height_helper/positioned_0_helper/chain_0_if.mcfunction",
+        "data/bl_example/function/binary_search/ocean_floor_height_helper/positioned_0_helper/chain_1_if.mcfunction",
+        "data/bl_example/function/binary_search/ocean_floor_height_helper/positioned_0_helper/chain_2_if.mcfunction",
+        "data/bl_example/function/binary_search/ocean_floor_height_runner.mcfunction"
+      ],
+      "source_hash": "2653a4dd44301d2276fed973eb652c52fc3b7fb5e7461b10f43def739d19faa1"
+    },
+    "data/bl_example/blocklight/fizzbuzz.bl": {
+      "needs_recompile": false,
+      "outputs": [
+        "data/bl_example/function/fizzbuzz/fizzbuzz.mcfunction",
+        "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0.mcfunction",
+        "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0_body.mcfunction",
+        "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0_body_helper/chain_0.mcfunction",
+        "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0_body_helper/chain_0_elif_0.mcfunction",
+        "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0_body_helper/chain_0_elif_1.mcfunction",
+        "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0_body_helper/chain_0_else.mcfunction",
+        "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0_body_helper/chain_0_if.mcfunction",
+        "data/bl_example/function/fizzbuzz/fizzbuzz_runner.mcfunction"
+      ],
+      "source_hash": "cafdbb0c65fb2a595556db11e00c993ddaefabbdc599e5bee16489622fa2beef"
+    },
+    "data/bl_example/blocklight/functions.bl": {
+      "needs_recompile": false,
+      "outputs": [
+        "data/bl_example/function/functions/hello.mcfunction",
+        "data/bl_example/function/functions/hello_load.mcfunction",
+        "data/bl_example/function/functions/hello_tick.mcfunction",
+        "data/bl_example/function/functions/return_0.mcfunction",
+        "data/bl_example/function/functions/return_0_helper/as_0.mcfunction",
+        "data/bl_example/function/functions/return_0_helper/as_0_helper/at_0.mcfunction",
+        "data/bl_example/function/functions/return_1.mcfunction",
+        "data/bl_example/function/functions/return_1_helper/as_0.mcfunction",
+        "data/bl_example/function/functions/return_1_helper/as_0_helper/return_0.mcfunction",
+        "data/bl_example/function/hello_root.mcfunction",
+        "data/bl_example/function/hello_universe.mcfunction"
+      ],
+      "source_hash": "93b48e0ed852fc26a3aca778a9b72641f11331e82064ae37980b0219d5b7a6a2"
+    },
+    "data/bl_example/blocklight/macros.bl": {
+      "needs_recompile": false,
+      "outputs": [
+        "data/bl_example/function/macros/macros_demo_a.mcfunction",
+        "data/bl_example/function/macros/macros_demo_a_helper/as_0.mcfunction",
+        "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0.mcfunction",
+        "data/bl_example/function/macros/macros_demo_a_helper/as_0_helper/at_0_helper/positioned_0.mcfunction",
+        "data/bl_example/function/macros/macros_demo_b.mcfunction",
+        "data/bl_example/function/macros/macros_demo_runner.mcfunction"
+      ],
+      "source_hash": "fef59c504b9096c85e68333661feaccfe6ca836081cc4b7be62c4cf6bdc564b0"
+    },
+    "data/bl_example/blocklight/python.bl": {
+      "needs_recompile": true,
+      "outputs": [
+        "data/bl_example/function/python/hardcode_example.mcfunction",
+        "data/bl_example/function/python/locators_example.mcfunction"
+      ],
+      "source_hash": "0e23eef4ce20eead9bc04c7c1fc221b3d38c845580be946e10fa19c7684e1820"
+    }
+  },
+  "tick": [
+    "bl_example:functions/hello_tick",
+    "bl_example:hello_universe"
+  ],
+  "version": [
+    1,
+    0
+  ]
+}

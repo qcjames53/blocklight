@@ -1,0 +1,32 @@
+# This example runs a game of Fizzbuzz using function macros for the inputs
+
+function fizzbuzz
+    scoreboard players set #i example_var 1
+    scoreboard players set #3 example_var 3
+    scoreboard players set #5 example_var 5
+    while (score #i example_var matches ..$(max))
+        scoreboard players operation #mod_a example_var = #i example_var
+        scoreboard players operation #mod_a example_var %= #3 example_var
+        scoreboard players operation #mod_b example_var = #i example_var
+        scoreboard players operation #mod_b example_var %= #5 example_var
+
+        if (score #mod_a example_var matches 0) and (score #mod_b example_var matches 0)
+            $say $(string_ab)
+        elif score #mod_a example_var matches 0
+            $say $(string_a)
+        elif score #mod_b example_var matches 0
+            $say $(string_b)
+        else
+            $say $(string_miss)
+
+        scoreboard players add #i example_var 1
+
+function fizzbuzz_runner
+    scoreboard objectives add example_var dummy
+    function bl_example:fizzbuzz/fizzbuzz { \
+        "max": 20, \
+        "string_a": "Fizz", \
+        "string_b": "Buzz", \
+        "string_ab": "Fizzbuzz", \
+        "string_miss": "..." \
+    }
