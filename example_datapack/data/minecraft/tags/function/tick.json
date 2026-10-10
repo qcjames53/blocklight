@@ -1,0 +1,6 @@
+{
+  "values": [
+    "bl_example:functions/hello_tick",
+    "bl_example:hello_universe"
+  ]
+}

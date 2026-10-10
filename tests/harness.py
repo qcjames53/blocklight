@@ -15,7 +15,6 @@ PACK_NAME = "pack"
 SOURCE_FILE = f"data/{NAMESPACE}/blocklight/main.bl"
 _PACK_MCMETA = '{"pack": {"description": "Blocklight test pack", "min_format": 107}}'
 _DEFAULT_OPTIONS = blocklight.CompilerOptions()
-_RESERVED_OBJECTIVE = "_bl"  # Stands in for compiler-emitted setup until the compiler creates it
 
 
 # Outcome of one Pack.call
@@ -56,7 +55,7 @@ class Pack(NamedTuple):
         command_limit: int = DEFAULT_COMMAND_LIMIT,
     ) -> Run:
         machine = Machine(self.functions, conditions=conditions, command_limit=command_limit)
-        for objective in [_RESERVED_OBJECTIVE, *objectives]:
+        for objective in objectives:
             machine.scores.setdefault(objective, {})
         for (holder, objective), value in (scores or {}).items():
             machine.scores.setdefault(objective, {})[holder] = value
@@ -108,9 +107,7 @@ def build(source: str | Mapping[str, str], *, options: blocklight.CompilerOption
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(contents, encoding="utf-8")
 
-        blocklight.reset_globals()
-        blocklight.tui.set_options(options)
-        blocklight.orchestration.run()
+        result = blocklight.Pack(options).compile()
 
         functions: dict[str, list[str]] = {}
         for path in sorted((pack_dir / "data").glob("*/function/**/*.mcfunction")):
@@ -120,9 +117,9 @@ def build(source: str | Mapping[str, str], *, options: blocklight.CompilerOption
             ]
         return Pack(
             functions=functions,
-            errors=blocklight.tui.get_errors(),
-            load_functions=frozenset(_function_id(Path(p)) for p in blocklight.orchestration.get_load_functions()),
-            tick_functions=frozenset(_function_id(Path(p)) for p in blocklight.orchestration.get_tick_functions()),
+            errors=result.errors,
+            load_functions=frozenset(_function_id(Path(p)) for p in result.load_functions),
+            tick_functions=frozenset(_function_id(Path(p)) for p in result.tick_functions),
         )
 
 

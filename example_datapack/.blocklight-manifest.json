@@ -1,11 +1,11 @@
 {
   "load": [
+    "_bl:load",
     "bl_example:functions/hello_load",
     "bl_example:hello_universe"
   ],
   "sources": {
     "data/bl_example/blocklight/binary_search.bl": {
-      "needs_recompile": false,
       "outputs": [
         "data/bl_example/function/binary_search/ocean_floor_height.mcfunction",
         "data/bl_example/function/binary_search/ocean_floor_height_helper/chain_0_if.mcfunction",
@@ -13,12 +13,12 @@
         "data/bl_example/function/binary_search/ocean_floor_height_helper/positioned_0_helper/chain_0_if.mcfunction",
         "data/bl_example/function/binary_search/ocean_floor_height_helper/positioned_0_helper/chain_1_if.mcfunction",
         "data/bl_example/function/binary_search/ocean_floor_height_helper/positioned_0_helper/chain_2_if.mcfunction",
+        "data/bl_example/function/binary_search/ocean_floor_height_helper/return_handler.mcfunction",
         "data/bl_example/function/binary_search/ocean_floor_height_runner.mcfunction"
       ],
-      "source_hash": "2653a4dd44301d2276fed973eb652c52fc3b7fb5e7461b10f43def739d19faa1"
+      "source_hash": "e66a7e4c7318c9cb7ebe54636bb349298377983cc5c2010639d3f051006dea26bc342d5fda8c38c339f68e087850e1cd2784bd71155be8661399997b67523a3d"
     },
     "data/bl_example/blocklight/fizzbuzz.bl": {
-      "needs_recompile": false,
       "outputs": [
         "data/bl_example/function/fizzbuzz/fizzbuzz.mcfunction",
         "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0.mcfunction",
@@ -30,10 +30,9 @@
         "data/bl_example/function/fizzbuzz/fizzbuzz_helper/while_0_body_helper/chain_0_if.mcfunction",
         "data/bl_example/function/fizzbuzz/fizzbuzz_runner.mcfunction"
       ],
-      "source_hash": "cafdbb0c65fb2a595556db11e00c993ddaefabbdc599e5bee16489622fa2beef"
+      "source_hash": "eb47be755e9644ffd7a3bbe63197574a863b3f81e2656c450856785b1b935a9fe12737c21ad40f834cc263560fcba5a9f982db7565c47df260870673cf6fd65f"
     },
     "data/bl_example/blocklight/functions.bl": {
-      "needs_recompile": false,
       "outputs": [
         "data/bl_example/function/functions/hello.mcfunction",
         "data/bl_example/function/functions/hello_load.mcfunction",
@@ -41,16 +40,17 @@
         "data/bl_example/function/functions/return_0.mcfunction",
         "data/bl_example/function/functions/return_0_helper/as_0.mcfunction",
         "data/bl_example/function/functions/return_0_helper/as_0_helper/at_0.mcfunction",
+        "data/bl_example/function/functions/return_0_helper/return_handler.mcfunction",
         "data/bl_example/function/functions/return_1.mcfunction",
         "data/bl_example/function/functions/return_1_helper/as_0.mcfunction",
         "data/bl_example/function/functions/return_1_helper/as_0_helper/return_0.mcfunction",
+        "data/bl_example/function/functions/return_1_helper/return_handler.mcfunction",
         "data/bl_example/function/hello_root.mcfunction",
         "data/bl_example/function/hello_universe.mcfunction"
       ],
-      "source_hash": "93b48e0ed852fc26a3aca778a9b72641f11331e82064ae37980b0219d5b7a6a2"
+      "source_hash": "eab34e58ce8c2bfd55317c476c57bf8ec3385b70cf9856b851ad2871e8af2e34ee685c6f06d959b037ae9aaf8df4735b5341afdcc4fcdfcaf91475c1f74b16ca"
     },
     "data/bl_example/blocklight/macros.bl": {
-      "needs_recompile": false,
       "outputs": [
         "data/bl_example/function/macros/macros_demo_a.mcfunction",
         "data/bl_example/function/macros/macros_demo_a_helper/as_0.mcfunction",
@@ -59,15 +59,13 @@
         "data/bl_example/function/macros/macros_demo_b.mcfunction",
         "data/bl_example/function/macros/macros_demo_runner.mcfunction"
       ],
-      "source_hash": "fef59c504b9096c85e68333661feaccfe6ca836081cc4b7be62c4cf6bdc564b0"
+      "source_hash": "4f35347cc2b07eb075d9404c64396be43bd53afbf29e86e9c0cbd89c8b060059367a7118efd37015a842ee7d57c8b06c22e88aeb5fd03b1bb55bbd1aa1aeeded"
     },
     "data/bl_example/blocklight/python.bl": {
-      "needs_recompile": true,
       "outputs": [
         "data/bl_example/function/python/hardcode_example.mcfunction",
         "data/bl_example/function/python/locators_example.mcfunction"
-      ],
-      "source_hash": "0e23eef4ce20eead9bc04c7c1fc221b3d38c845580be946e10fa19c7684e1820"
+      ]
     }
   },
   "tick": [

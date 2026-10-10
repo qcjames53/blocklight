@@ -1,35 +1,69 @@
 #!/usr/bin/env python3
-"""Blocklight - A blazing fast mcfunction microcompiler"""
+
+# ----- Blocklight ----- #
+# A blazing fast mcfunction microcompiler
+# © 2026 by Quinn James. Licensed under the GNU GPL v3.
+# See https://github.com/qcjames53/blocklight for documentation and license info.
+
+
+# ----- Quick start ----- #
+# 1) Install Python on your system (3.10+).
+# 2) Copy this script to your datapack's top level directory (e.g. `my_pack/blocklight.py`).
+# 3) Create your .bl source files in `<pack>/data/<namespace>/blocklight/`. See the GitHub link above for examples.
+# 4) Run the compiler in the terminal from the pack root with `python3 blocklight.py`. Pass `--help` for options.
+
+
+# ----- Contributor guidelines ----- #
+# When developing changes, please keep these tenets in mind:
+#
+# 1) Mcfunction is not a normal language, so a normal compiler is the wrong tool; blocklight syntax must allow for messy
+#    mcfunction cleverness without binding datapack authors to a structured "happy path".
+# 2) The compiler must remain portable, distributable, free, and broadly compatible with future Minecraft updates.
+# 3) Compile operations must remain accurate, idempotent, resource efficient, and output must co-exist peacefully with
+#    files the user has hand-created.
+# 4) Failures are recoverable on re-compile, clear to understand, and isolated to a single function where possible.
+# 5) The language model must maintain broadly independent source files.
+# 6) Custom compiler-only behavior should take the form of a one line command or block header with a leading reserved
+#    keyword. Indentation indicates block contents.
+# 7) Avoid parsing vanilla command syntax wherever possible. Pass it through. Minecraft updates can easily break things.
+# 8) Don't delete or modify any file unless Blocklight created it. Exceptions (e.g. load/tick tags) must be very robust.
+# 9) Vanilla function macros and vanilla return commands are to be supported everywhere, no exceptions.
+#
+# Thank you very much for reading all of this! Contributions and issues are more than welcome on GitHub. I look forward
+# to seeing what you create! - Quinn
 
 import argparse
 import enum
-import hashlib
+import functools
 import json
 import os
 import stat
 import string
 import sys
 import textwrap
-import threading
 import time
+from _blake2 import blake2b
 from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from typing import IO, ClassVar, NamedTuple, cast
 
 # ----- Tweakable constants ----- #
 _BL_VERSION = (1, 0)
 _BL_IS_DEV_BUILD = True
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
-_FILE_WRITE_WORKERS_COUNT = 8
 
 # ----- Compiler internal constants ----- #
 _BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
 _IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # Windows junction; stat only defines it on Windows
+_ANSI_RED = "\033[31m"
+_ANSI_GREEN = "\033[32m"
+_ANSI_YELLOW = "\033[33m"
+_ANSI_BLUE = "\033[34m"
+_ANSI_WHITE = "\033[37m"
+_ANSI_GREY = "\033[90m"
+_ANSI_RESET = "\033[0m"
 
 
-# ----- Keywords ----- #
 class _KeywordType(enum.Enum):
     MODIFIER = enum.auto()  # execute-modifier: recurses into a new child .mcfunction
     CONDITIONAL = enum.auto()  # if / elif / else / while - reserved, not yet implemented
@@ -60,26 +94,10 @@ class _Line(NamedTuple):
         return name_part.strip(), "root" in modifiers, "load" in modifiers, "tick" in modifiers
 
 
-# Condition leaf: body of one `execute if` subcommand, e.g. "score @s v matches 1"
-class _CondAtom(NamedTuple):
-    text: str
-    negated: bool = False  # compiles to `unless` instead of `if`
-
-
-# Condition operator node. `op` is "and", "or" or "not" (one term).
-class _CondOp(NamedTuple):
-    op: str
-    terms: tuple["_CondAtom | _CondOp", ...]
-
-
-_CondNode = _CondAtom | _CondOp
-
-
 # One bl source file's properties stored in the manifest
 class _ManifestSourceEntry(NamedTuple):
     source_hash: str
     outputs: frozenset[str]
-    needs_recompile: bool
 
 
 # Manifest file tracking facets of the previous compile
@@ -102,7 +120,7 @@ class BLNonFatalError(BLError):  # Nonfatal error, keep compile going in next fu
     pass
 
 
-class BLFatalError(BLError):  # Fatal error, stop compile of this concurrency.
+class BLFatalError(BLError):  # Fatal error, stop compiling this source file.
     pass
 
 
@@ -118,459 +136,661 @@ class BLPythonError(BLNonFatalError):  # Raised while compiling a python: block.
     pass
 
 
-# Whether `path` itself is a symlink or Windows junction, without following it.
-def _is_link(path: str) -> bool:
+# Bare conditional statement in `execute if` subcommand (e.g. "score @s v matches 1")
+class _ConditionalStatement(NamedTuple):
+    text: str
+    negated: bool = False  # compiles to `unless` instead of `if`
+
+
+# Condition operator node ("and", "or" or "not").
+class _ConditionalOperator(NamedTuple):
+    op: str
+    terms: tuple["_ConditionalStatement | _ConditionalOperator", ...]
+
+
+_ConditionalNode = _ConditionalStatement | _ConditionalOperator
+
+
+# Whether `path` (relative to `root`) or any folder between it and `root` is a symlink (or junction). Cached so a
+# folder shared by many paths is checked once; Pack.compile() clears the cache so each run sees the disk afresh.
+@functools.cache
+def _contains_symlink(path: str, root: str) -> bool:
+    path = os.path.normpath(path)
     try:
-        st = os.lstat(path)
+        st = os.lstat(os.path.join(root, path))
+        if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT:
+            return True
     except OSError:
+        pass  # missing: nothing here to follow
+    parent = os.path.dirname(path)
+    return bool(parent) and parent != path and _contains_symlink(parent, root)
+
+
+# Whether `filepath` normalizes to a path inside data/<namespace>/function. Rejects malformed namespaces.
+def _in_function_dir(filepath: str, namespace: str) -> bool:
+    if namespace in ("", ".", "..") or "/" in namespace or os.sep in namespace:
         return False
-    return stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+    expected_root = os.path.normpath(f"data/{namespace}/function")
+    normalized = os.path.normpath(filepath)
+    return normalized == expected_root or normalized.startswith(expected_root + os.sep)
 
 
-# First component of `path` (walked from the working directory, or root if absolute) that is a
-# symlink or junction, else None. Components are checked as written so '..' cannot hide one.
-def _find_link(path: str) -> str | None:
-    if os.altsep:
-        path = path.replace(os.altsep, os.sep)
-    drive, rest = os.path.splitdrive(path)
-    prefix = drive + (os.sep if rest.startswith(os.sep) else "")
-    for part in rest.split(os.sep):
-        if part in ("", "."):
+# Clean lines from any (line number, raw text) source
+# Drops trailing whitespace, blank lines, collapses newlines, strips leading macro symbols, and removes comments.
+def _iter_clean_lines(numbered_lines: Iterable[tuple[int, str]]) -> Iterator[_Line]:
+    pending: _Line | None = None
+    for line_number, raw_line in numbered_lines:
+        line = raw_line.rstrip()
+        lstrip_line = line.lstrip()
+
+        # Strip comment and whitespace lines
+        if lstrip_line.startswith("#") or len(lstrip_line) == 0:
+            if pending is not None and pending.text.endswith("\\"):
+                pending = _Line(pending.text[:-1], pending.lineno)
             continue
-        prefix = os.path.join(prefix, part) if prefix else part
-        if _is_link(prefix):
-            return prefix
-        if not os.path.lexists(prefix):
-            return None  # nothing further along exists to follow
-    return None
+        if lstrip_line.startswith("$") and not lstrip_line.startswith("$("):
+            line = line[: len(line) - len(lstrip_line)] + lstrip_line[1:]
+            lstrip_line = lstrip_line[1:]
+
+        if pending is not None and pending.text.endswith("\\"):
+            pending = _Line(pending.text[:-1] + lstrip_line, pending.lineno)
+        else:
+            if pending is not None:
+                yield pending
+            pending = _Line(line, line_number)
+    if pending is not None:
+        if pending.text.endswith("\\"):
+            pending = _Line(pending.text[:-1], pending.lineno)
+        yield pending
 
 
-# With --no-symlink, an error if reaching `path` would pass through a symlink, else None.
-def _symlink_refusal(path: str, action: str) -> BLFileError | None:
-    if not tui.get_no_symlink():
-        return None
-    link = _find_link(path)
-    if link is None:
-        return None
-    via = "" if link == os.path.normpath(path) else f" through symlink '{link}'"
-    return BLFileError(f"Refusing to {action} '{path}'{via} (--no-symlink is set).")
-
-
-# open() that, with --no-symlink, fails instead of following a symlink at the final path component.
-# Closes the gap between a _symlink_refusal check and the open itself. No-op where O_NOFOLLOW is missing.
-def _open(path: str, mode: str = "r") -> IO[str]:
-    no_follow = getattr(os, "O_NOFOLLOW", 0) if tui.get_no_symlink() else 0
-    return open(path, mode, encoding="utf-8", opener=lambda p, flags: os.open(p, flags | no_follow))
-
-
-# Contents and metadata surrounding a bl source file. Reads file from disk on init.
-@dataclass
-class SourceFile:
+# A bl source file's contents + metadata.
+class SourceFile(NamedTuple):
     local_path: str
     namespace: str
-    source_lines: list[_Line] = field(init=False)
+    source_lines: list[_Line]
 
-    # Opens, reads, and cleans the source file. Logs and raises BLFileError on failure.
-    def __post_init__(self) -> None:
-        try:
-            with _open(self.local_path) as f:
-                self.source_lines = list(self._iter_clean_lines(enumerate(f, start=1)))
-        except (OSError, UnicodeDecodeError) as err:
-            detail = err.strerror if isinstance(err, OSError) and err.strerror else str(err)
-            error = BLFileError(f"Failed to read '{self.local_path}': {detail}.")
-            error.filename = self.local_path
-            tui.log_error(error)
-            raise error from err
+    # Source file from its raw `text`: comments and blank lines dropped, '\' continuations joined.
+    @classmethod
+    def parse(cls, local_path: str, namespace: str, text: str) -> "SourceFile":
+        return cls(local_path, namespace, list(_iter_clean_lines(enumerate(text.split("\n"), start=1))))
 
-    # sha256 hash of bl source file's cleaned contents
+    # Hash of bl source file's cleaned contents
     @property
     def content_hash(self) -> str:
-        hasher = hashlib.sha256()
+        hasher = blake2b()
         for line in self.source_lines:
             hasher.update(line.text.encode("utf-8"))
             hasher.update(b"\n")
         return hasher.hexdigest()
 
-    # Yields clean lines from any (line number, raw text) source.
-    @staticmethod
-    def _iter_clean_lines(numbered_lines: Iterable[tuple[int, str]]) -> Iterator[_Line]:
-        pending: _Line | None = None
-        for line_number, raw_line in numbered_lines:
-            line = raw_line.rstrip()
-            lstrip_line = line.lstrip()
 
-            # Strip comment and whitespace lines
-            if lstrip_line.startswith("#") or len(lstrip_line) == 0:
-                continue
-
-            if pending is not None and pending.text.endswith("\\"):
-                pending = _Line(pending.text[:-1] + lstrip_line, pending.lineno)
-            else:
-                if pending is not None:
-                    yield pending
-                pending = _Line(line, line_number)
-        if pending is not None:
-            if pending.text.endswith("\\"):
-                pending = _Line(pending.text[:-1], pending.lineno)
-            yield pending
-
-
-# Compile-time options, owned and parsed by TUI.
-@dataclass(frozen=True)
-class CompilerOptions:
+# Compile-time options parsed from the command line.
+class CompilerOptions(NamedTuple):
     no_python: bool = False  # Throw an error on `python:` blocks instead of executing them
     no_symlink: bool = False  # Refuse to follow symlinked directories or read symlinked bl source files
     dry_run: bool = False  # Compile in-memory only; do not write any files to disk
     force: bool = False  # Recompile every bl source regardless of the cached hash
 
 
+# Information about the datapack + compile options used at compile time.
+class _PackInfo(NamedTuple):
+    name: str  # the datapack's folder name
+    format: int | None  # from pack.mcmeta; None if it declares none
+    options: CompilerOptions
+
+
 # Read-only context threaded through the compilation of one block
-@dataclass
-class _BlockInput:
-    sf: SourceFile
+class _BlockInput(NamedTuple):
     source_function_name: str  # Name of the top-level function from the function def
     function_name: str  # Name of the output function this block will compile into
+    depth: int  # Indentation depth of the block's lines; 1 for a function's own body
 
 
 # Mutable accumulator built up while compiling one block.
-@dataclass
 class _BlockOutput:
-    lines: list[str] = field(default_factory=list[str])  # compiled mcfunction command lines
-    macros: set[str] = field(default_factory=set[str])  # vanilla macros the block may use
-    can_return: bool = False  # whether the block may early-return
+    def __init__(self) -> None:
+        self.lines: list[str] = []  # compiled mcfunction command lines
+        self.macros: set[str] = set()  # vanilla macros the block may use
+        self.can_return = False  # whether the block may early-return
 
 
 # if/elif condition compiled to execute subcommands
 class _CompiledCondition(NamedTuple):
     setup_lines: list[_Line]  # run immediately before testing `subcommands`
     subcommands: str  # e.g. "if score @s v matches 1 unless function pack:f_helper/cond_0"
-    report_error_command: str | None  # run if the cond holder reports a macro substitution failure
     macros: set[str]  # macros referenced by `setup_lines` and `subcommands`
 
 
-# The `bl` object exposed inside python blocks
-class _PythonBlockContext:
-    def __init__(self, block_in: _BlockInput) -> None:
-        sf = block_in.sf
-        self.PATH = sf.local_path
-        self.FILE = sf.local_path.rsplit("/", 1)[-1]
-        self.NAMESPACE = sf.namespace
-        self.PACK_NAME = orchestration.get_pack_name()
-        self.PACK_FORMAT = orchestration.get_pack_format()
-        self.FUNCTION_NAME = block_in.source_function_name
-        self.OUTPUT_FUNCTION_NAME = block_in.function_name
-        self.BLOCKLIGHT_VERSION = _BL_VERSION_STRING
+# Read-only context threaded through the compilation of one if/elif/while condition
+class _ConditionInput(NamedTuple):
+    block_in: _BlockInput
+    line: _Line
+    or_functions: dict[_ConditionalOperator, str]  # helper function written per distinct 'or' node
 
 
-# Parses CLI args, collects errors and write/skip counts, and reports them on stderr.
-# Error logging and counters are thread safe.
-class TUI:
+# One compiled mcfunction output file's contents + linedef.
+class _MCFOutputContents(NamedTuple):
+    contents: str
+    line: _Line
+
+
+# The output of compiling one bl source file
+class CompiledSource:
     def __init__(self) -> None:
-        self._options = CompilerOptions()
-        self._errors: list[BLError] = []
-        self._lock = threading.Lock()  # guards _errors, _written and _skipped
-        self._written = 0
-        self._skipped = 0
-        self._start_time = 0.0
-
-    def set_options(self, options: CompilerOptions) -> None:
-        self._options = options
-
-    def parse_args(self, argv: list[str] | None = None) -> None:
-        parser = argparse.ArgumentParser(prog="blocklight", description=__doc__)
-        parser.add_argument("--version", action="version", version=f"Blocklight {_BL_VERSION_STRING}")
-        parser.add_argument(
-            "--no-python", action="store_true", help="reject 'python:' blocks instead of executing them at compile time"
-        )
-        parser.add_argument(
-            "--no-symlink",
-            action="store_true",
-            help="refuse to follow symlinked directories or read symlinked bl source files",
-        )
-        parser.add_argument(
-            "--safe",
-            action="store_true",
-            help="safely compile a datapack if you do not trust the author",
-        )
-        parser.add_argument(
-            "--dry-run",
-            action="store_true",
-            help="test compile without writing any files to disk",
-        )
-        parser.add_argument(
-            "--force",
-            action="store_true",
-            help="ignore manifest hashing and force recompile of all files",
-        )
-        args = parser.parse_args(argv)
-        self.set_options(
-            CompilerOptions(
-                no_python=args.no_python or args.safe,
-                no_symlink=args.no_symlink or args.safe,
-                dry_run=args.dry_run,
-                force=args.force,
-            )
-        )
-
-    def get_no_python(self) -> bool:
-        return self._options.no_python
-
-    def get_no_symlink(self) -> bool:
-        return self._options.no_symlink
-
-    def get_dry_run(self) -> bool:
-        return self._options.dry_run
-
-    def get_force(self) -> bool:
-        return self._options.force
-
-    def log_error(self, error: BLError) -> None:
-        # Write under the lock so concurrent errors print whole and in the same order as _errors.
-        with self._lock:
-            self._errors.append(error)
-            sys.stderr.write(f"{type(error).__name__}: {error}\n")
-            sys.stderr.flush()
-
-    def get_errors(self) -> list[BLError]:
-        with self._lock:
-            return list(self._errors)
-
-    def tick_written(self) -> None:
-        with self._lock:
-            self._written += 1
-
-    def tick_skipped(self) -> None:
-        with self._lock:
-            self._skipped += 1
-
-    # Starts the compile clock.
-    def start(self) -> None:
-        self._start_time = time.monotonic()
-
-    # Prints the final compile summary
-    def finish(self) -> None:
-        elapsed = time.monotonic() - self._start_time
-        summary = (
-            f"Compiled {orchestration.get_pack_name()} in {elapsed:.3f} seconds."
-            f" [{self._written} written / {self._skipped} skipped]"
-        )
-        if self._errors:
-            summary += " (see above for errors)"
-        print(summary)
+        self.mcf_outputs: dict[str, _MCFOutputContents] = {}
+        self.load: set[str] = set()  # output paths of load functions
+        self.tick: set[str] = set()  # output paths of tick functions
+        self.errors: list[BLError] = []
+        self.ran_python = False  # a python block ran, and may emit something different next run
 
 
-# Owns pack.mcmeta/manifest state, discovery, both thread pools, and every datapack-level
-# collection (compiled files, load/tick functions, bl source hashes/outputs, needs_recompile).
-class Orchestration:
+# Compile info exposed inside python blocks as the `bl` object
+class _PythonBlockContext(NamedTuple):
+    PATH: str
+    FILE: str
+    NAMESPACE: str
+    PACK_NAME: str
+    PACK_FORMAT: int | None
+    FUNCTION_NAME: str
+    OUTPUT_FUNCTION_NAME: str
+    BLOCKLIGHT_VERSION: str = _BL_VERSION_STRING
+
+
+# What writing one output did, or would do in a dry run
+class _WriteOutcome(enum.Enum):
+    NEW = enum.auto()
+    MODIFIED = enum.auto()
+    UNCHANGED = enum.auto()
+
+
+# Outcome of one build: its errors in order, the functions registered for the load and tick tags, and the counts
+# the terminal summary prints.
+class BuildResult:
+    def __init__(self) -> None:
+        self.pack_name = ""
+        self.errors: list[BLError] = []
+        self.load_functions: set[str] = set()  # output paths
+        self.tick_functions: set[str] = set()  # output paths
+        self.sources_read = 0
+        self.sources_skipped = 0
+        self.outputs_new = 0
+        self.outputs_modified = 0
+        self.outputs_unchanged = 0
+        self.outputs_reused = 0  # kept as-is from sources that were not recompiled
+        self.outputs_deleted = 0  # stale outputs and the setup function, once no sources are left
+
+
+# ----- Terminal ----- #
+# Print the compile results. All errors + a status line.
+def report(result: BuildResult, elapsed: float) -> None:
+    for error in result.errors:
+        # Errors get stderr + red
+        sys.stderr.write(_color(f"{type(error).__name__}: {error}", _ANSI_RED, sys.stderr) + "\n")
+    sys.stderr.flush()
+
+    line = _color(result.pack_name, _ANSI_WHITE, sys.stdout) + _color(": ", _ANSI_GREY, sys.stdout)
+    total = result.outputs_new + result.outputs_modified + result.outputs_unchanged + result.outputs_reused
+    functions = f"{total} function{'' if total == 1 else 's'}"
+    if result.errors:
+        line += _color(f"compiled {functions} with errors", _ANSI_RED, sys.stdout)
+    else:
+        line += _color(f"compiled {functions}", _ANSI_GREEN, sys.stdout)
+    changes: list[str] = []
+    if result.outputs_new > 0:
+        changes.append(_color(f"{result.outputs_new} new", _ANSI_BLUE, sys.stdout))
+    if result.outputs_modified > 0:
+        changes.append(_color(f"{result.outputs_modified} modified", _ANSI_YELLOW, sys.stdout))
+    if result.outputs_deleted > 0:
+        changes.append(_color(f"{result.outputs_deleted} deleted", _ANSI_RED, sys.stdout))
+    if len(changes) == 0:
+        changes = [_color("no changes", _ANSI_GREY, sys.stdout)]
+    line += _color(f" ({', '.join(changes)})", _ANSI_GREY, sys.stdout)
+    line += _color(f" {round(elapsed * 1000)}ms", _ANSI_YELLOW, sys.stdout)
+    print(line)
+
+
+# Wraps text in an ANSI color code, only when the stream is a terminal and NO_COLOR is unset.
+def _color(text: str, code: str, stream: IO[str]) -> str:
+    if os.environ.get("NO_COLOR") or not stream.isatty():
+        return text
+    return f"{code}{text}{_ANSI_RESET}"
+
+
+# Handles pack reads + writes, orchestrating compiles, and organizing pack metadata + diffs.
+class Pack:
     _MANIFEST_FILENAME = ".blocklight-manifest.json"
+    _FUNCTION_TAG_DIR = "data/minecraft/tags/function"
+    _SETUP_FUNCTION_FILEPATH = "data/_bl/function/load.mcfunction"
 
-    def __init__(self) -> None:
-        self._pack_name: str = ""
-        self._pack_format: int | None = None
+    def __init__(self, options: CompilerOptions) -> None:
+        self._options = options
+        self._info = _PackInfo("", None, options)  # filled in from pack.mcmeta
+        self._result = BuildResult()
         self._previous_manifest: _Manifest | None = None
-        self._files: set[str] = set()
-        self._load_functions: set[str] = set()
-        self._tick_functions: set[str] = set()
+        self._manifest_file: IO[str] | None = None  # open from _read_manifest until _write_manifest
+        self._files: set[str] = set()  # outputs on disk this run: written, unchanged or reused
         self._source_hashes: dict[str, str] = {}
-        self._source_outputs: dict[str, set[str]] = {}
+        self._source_outputs: dict[str, dict[str, _Line | None]] = {}  # source -> output -> defining line
+        self._failed_writes: set[str] = set()  # produced outputs that could not be written
+        self._deleted: set[str] = set()  # files deleted this run, or that a dry run would delete
         self._needs_recompile: set[str] = set()
-        self._write_executor = ThreadPoolExecutor(max_workers=_FILE_WRITE_WORKERS_COUNT)
+        self._pack_root_dir = os.getcwd()  # pack root: symlink checks stop here
 
-    def get_pack_name(self) -> str:
-        return self._pack_name
+    # Compile the datapack at the current directory.
+    def compile(self) -> BuildResult:
+        _contains_symlink.cache_clear()  # links may have changed since an earlier compile in this process
+        self._read_pack_meta()
+        if self._options.no_symlink and _contains_symlink("data", self._pack_root_dir):
+            self._log_error(BLFileError("Refusing to read 'data': the path contains a symlink."))
+            return self._result
+        if not os.path.isdir("data"):
+            return self._result
 
-    def get_pack_format(self) -> int | None:
-        return self._pack_format
+        try:
+            self._previous_manifest = self._read_manifest()
+        except BLFileError as err:
+            if self._manifest_file is not None:
+                self._manifest_file.close()
+            self._log_error(BLFileError(f"{err} Compile aborted."))
+            return self._result
 
-    def get_files(self) -> frozenset[str]:
-        return frozenset(self._files)
+        sources = self._discover_sources()
+        for local_path, namespace in sources.items():
+            try:
+                self._compile_source(local_path, namespace)
+            except Exception as err:  # a bug or unanticipated failure must not vanish silently
+                self._report_error(local_path, BLFileError(f"Unexpected error while compiling: {err}."))
 
-    def get_load_functions(self) -> frozenset[str]:
-        return frozenset(self._load_functions)
+        producers = self._output_producers()
+        self._report_collisions(producers)
+        self._delete_stale_outputs(producers)
+        if sources:
+            self._write_setup_function(producers)
+        else:  # no sources left
+            self._delete_setup_function()
+        self._result.outputs_deleted = len(self._deleted)
+        if not self._options.dry_run:
+            self._prune_empty_dirs()
+            self._write_function_tags()
+            self._write_manifest()
+        return self._result
 
-    def get_tick_functions(self) -> frozenset[str]:
-        return frozenset(self._tick_functions)
+    # Read pack.mcmeta's format and take the pack's name from its folder.
+    def _read_pack_meta(self) -> None:
+        if self._options.no_symlink and _contains_symlink("pack.mcmeta", self._pack_root_dir):
+            raise SystemExit("Refusing to read 'pack.mcmeta': the path contains a symlink.")
+        if not os.path.isfile("pack.mcmeta"):
+            raise SystemExit("No 'pack.mcmeta' found in the current directory.")
+        with self._open_symlink_safe("pack.mcmeta") as f:
+            try:
+                pack_meta: dict[str, object] = json.load(f)
+            except json.JSONDecodeError as err:
+                raise SystemExit(f"Malformed JSON in 'pack.mcmeta': {err}.") from err
 
-    # The previous run's record for this bl source, if any.
-    def get_previous_manifest_entry(self, local_path: str) -> _ManifestSourceEntry | None:
-        return self._previous_manifest.sources.get(local_path) if self._previous_manifest else None
+        name = os.path.basename(os.getcwd())
+        self._info = _PackInfo(name, self._read_pack_format(pack_meta), self._options)
+        self._result.pack_name = name
 
-    def get_previous_compiler_version(self) -> tuple[int, int] | None:
-        return self._previous_manifest.version if self._previous_manifest else None
+    # Each .bl file under data/<namespace>/blocklight/ -> its namespace. Invalid names are logged and skipped.
+    def _discover_sources(self) -> dict[str, str]:
+        sources: dict[str, str] = {}
+        for namespace in sorted(os.listdir("data")):
+            namespace_dir = os.path.join("data", namespace)
+            if self._options.no_symlink and _contains_symlink(namespace_dir, self._pack_root_dir):
+                self._log_error(
+                    BLFileError(f"Refusing to read namespace '{namespace_dir}': the path contains a symlink.")
+                )
+                continue
+            if not os.path.isdir(namespace_dir):
+                continue
+            blocklight_dir = os.path.join(namespace_dir, "blocklight")
+            for local_path in self._iter_bl_files(blocklight_dir):
+                # Folder and file names become part of the function id
+                names = local_path.removesuffix(".bl").split("/")[3:]
+                if any(not name or set(name) - _FUNCTION_NAME_CHARS for name in names):
+                    self._log_error(
+                        BLSyntaxError(
+                            f"The source path '{local_path}' may only use a-z, 0-9, '_' and '-' in folder and "
+                            "file names."
+                        )
+                    )
+                    continue
+                sources[local_path] = namespace
+        return sources
 
-    def record_source(self, local_path: str, content_hash: str) -> None:
+    # Compile one bl source file and write outputs to disk if appropriate (respecting I/O file caching)
+    def _compile_source(self, local_path: str, namespace: str) -> None:
+        try:
+            text = self._read_text(local_path, "read")
+        except BLFileError as err:
+            self._report_error(local_path, err)
+            return
+        if text is None:  # deleted since discovery
+            return
+        source = SourceFile.parse(local_path, namespace, text)
+        content_hash = source.content_hash
+        self._result.sources_read += 1
         self._source_hashes[local_path] = content_hash
-        self._source_outputs.setdefault(local_path, set())
+        self._source_outputs[local_path] = {}
+        if self._reuse_outputs(local_path, content_hash):
+            self._result.sources_skipped += 1
+            return
 
-    def mark_needs_recompile(self, local_path: str) -> None:
-        self._needs_recompile.add(local_path)
+        compiled = Compile(source, self._info).compile()
+        for error in compiled.errors:
+            self._report_error(local_path, error)
+        if compiled.ran_python:
+            self._needs_recompile.add(local_path)
+        for filepath, output in compiled.mcf_outputs.items():
+            self._source_outputs[local_path][filepath] = output.line
+            try:
+                outcome = self._write_output(filepath, output.contents)
+            except BLFileError as err:
+                err.lineno, err.text = output.line.lineno, output.line.text
+                self._failed_writes.add(filepath)
+                self._report_error(local_path, err)
+                continue
+            self._files.add(filepath)
+            self._count_write(outcome)
+        self._result.load_functions |= compiled.load
+        self._result.tick_functions |= compiled.tick
+
+    # Re-register `local_path`'s previous outputs without recompiling, if they are still current. Returns whether
+    # they were.
+    def _reuse_outputs(self, local_path: str, content_hash: str) -> bool:
+        previous = self._previous_manifest
+        entry = previous.sources.get(local_path) if previous else None
+        if (
+            self._options.force
+            or previous is None
+            or entry is None
+            or previous.version != _BL_VERSION
+            or entry.source_hash != content_hash
+            or not all(os.path.isfile(output) for output in entry.outputs)
+        ):
+            return False
+        self._result.outputs_reused += len(entry.outputs)
+        for output in entry.outputs:
+            self._files.add(output)
+            self._source_outputs[local_path][output] = None
+            function_id = self._function_id(output)
+            if function_id in previous.load:
+                self._result.load_functions.add(output)
+            if function_id in previous.tick:
+                self._result.tick_functions.add(output)
+        return True
+
+    def _count_write(self, outcome: _WriteOutcome) -> None:
+        match outcome:
+            case _WriteOutcome.NEW:
+                self._result.outputs_new += 1
+            case _WriteOutcome.MODIFIED:
+                self._result.outputs_modified += 1
+            case _WriteOutcome.UNCHANGED:
+                self._result.outputs_unchanged += 1
+
+    def _log_error(self, error: BLError) -> None:
+        self._result.errors.append(error)
 
     # Log an error and force a recompile of `local_path` next run.
-    def report_error(self, local_path: str, error: BLError) -> None:
+    def _report_error(self, local_path: str, error: BLError) -> None:
         error.filename = local_path
-        tui.log_error(error)
-        self.mark_needs_recompile(local_path)
+        self._log_error(error)
+        self._needs_recompile.add(local_path)
 
-    # Re-registers one previously-produced output file without rewriting it.
-    def reuse_output_file(self, local_path: str, output: str) -> None:
-        self._files.add(output)
-        self._source_outputs.setdefault(local_path, set()).add(output)
-        tui.tick_skipped()
+    # Safely write `contents` to `path`. Returns what the write did (or would do, in a dry run).
+    def _write_output(self, path: str, contents: str) -> _WriteOutcome:
+        existing = self._read_text(path, "write")
+        if existing == contents:
+            return _WriteOutcome.UNCHANGED
+        # Empty counts as ours: there is nothing in it to lose, and an interrupted write can leave one
+        if existing and Compile.HEADER_MARKER not in existing:
+            raise BLFileError(f"Refusing to overwrite '{path}': missing the Blocklight header.")
+        if not self._options.dry_run:
+            self._write_text(path, contents, "write")
+        return _WriteOutcome.NEW if existing is None else _WriteOutcome.MODIFIED
+
+    # Normalized path of each output produced this run -> (source, defining line or None if reused) per producer.
+    def _output_producers(self) -> dict[str, list[tuple[str, _Line | None]]]:
+        producers: dict[str, list[tuple[str, _Line | None]]] = {}
+        for local_path, outputs in self._source_outputs.items():
+            for output, line in outputs.items():
+                producers.setdefault(os.path.normpath(output), []).append((local_path, line))
+        return producers
+
+    # Report outputs produced by more than one source. Writes don't catch these, since the second source sees
+    # the first's file as an earlier Blocklight output and replaces it.
+    def _report_collisions(self, producers: dict[str, list[tuple[str, _Line | None]]]) -> None:
+        for path, sources in sorted(producers.items()):
+            if len(sources) < 2:
+                continue
+            for local_path, line in sources:
+                others = ", ".join(sorted(f"'{other}'" for other, _line in sources if other != local_path))
+                self._report_error(local_path, BLFileError(f"The output '{path}' is also compiled by {others}.", line))
+
+    # Delete the previous run's outputs that nothing produced this run. A dry run checks and counts them only.
+    def _delete_stale_outputs(self, producers: dict[str, list[tuple[str, _Line | None]]]) -> None:
         if self._previous_manifest is None:
             return
-        function_id = self._function_id(output)
-        if function_id in self._previous_manifest.load:
-            self.register_load_function(output)
-        if function_id in self._previous_manifest.tick:
-            self.register_tick_function(output)
-
-    def register_load_function(self, function_output_filepath: str) -> None:
-        self._load_functions.add(function_output_filepath)
-
-    def register_tick_function(self, function_output_filepath: str) -> None:
-        self._tick_functions.add(function_output_filepath)
-
-    # Validates namespace containment, then writes the output file to disk using write executors.
-    def write_output_file(
-        self, filepath: str, contents: str, function_def_line: _Line, local_path: str, namespace: str
-    ) -> None:
-        if not self._in_function_dir(filepath, namespace):
-            err = BLFileError(f"Output path '{filepath}' escapes namespace '{namespace}'.", function_def_line)
-            self.report_error(local_path, err)
-            return
-        if tui.get_dry_run():
-            self._files.add(filepath)
-            self._source_outputs.setdefault(local_path, set()).add(filepath)
-            tui.tick_written()
-            return
-        self._write_executor.submit(self._persist_file, filepath, contents, function_def_line, local_path)
-
-    # Wait for all write executors to finish.
-    def wait_for_writes(self) -> None:
-        self._write_executor.shutdown(wait=True)
+        for local_path, entry in sorted(self._previous_manifest.sources.items()):
+            for output in sorted(entry.outputs):
+                if os.path.normpath(output) not in producers:
+                    self._delete_stale_output(output, local_path)
 
     # Delete one stale output file. Paths come from the manifest, so they are untrusted: only deletes
     # a .mcfunction inside data/<namespace>/function of the source's namespace, carrying the Blocklight header.
-    def delete_stale_output(self, filepath: str, local_path: str) -> None:
+    def _delete_stale_output(self, filepath: str, local_path: str) -> None:
+        filepath = os.path.normpath(filepath)
         parts = os.path.normpath(local_path).split(os.sep)
         namespace = parts[1] if len(parts) > 3 and parts[0] == "data" and parts[2] == "blocklight" else ""
-        if not filepath.endswith(".mcfunction") or not self._in_function_dir(filepath, namespace):
+        if not filepath.endswith(".mcfunction") or not _in_function_dir(filepath, namespace):
             error = BLFileError(f"Refusing to delete '{filepath}': not an output file of '{local_path}'.")
-            self.report_error(local_path, error)
+            self._report_error(local_path, error)
             return
-        if refusal := _symlink_refusal(filepath, "delete stale file"):
-            self.report_error(local_path, refusal)
+        if self._options.no_symlink and _contains_symlink(filepath, self._pack_root_dir):
+            error = BLFileError(f"Refusing to delete stale file '{filepath}': the path contains a symlink.")
+            self._report_error(local_path, error)
             return
         if not os.path.isfile(filepath):
             return
-
-        # Verify header
         try:
-            with _open(filepath) as f:
+            with self._open_symlink_safe(filepath) as f:
                 content = f.read()
         except OSError as err:
-            error = BLFileError(f"Failed to verify '{filepath}' before deleting: {err.strerror}.")
-            self.report_error(local_path, error)
+            error = BLFileError(f"Failed to verify stale file '{filepath}': {err.strerror or err}.")
+            self._report_error(local_path, error)
             return
         if Compile.HEADER_MARKER not in content:
             error = BLFileError(f"Refusing to delete '{filepath}': missing the Blocklight header.")
-            self.report_error(local_path, error)
+            self._report_error(local_path, error)
             return
 
         # Delete file
         try:
-            os.remove(filepath)
+            if not self._options.dry_run:
+                os.remove(filepath)
         except OSError as err:
-            error = BLFileError(f"Failed to delete stale file '{filepath}': {err.strerror}.")
-            self.report_error(local_path, error)
-
-    # Locate pack.mcmeta and every .bl file under data/<namespace>/blocklight/, compiling each
-    # concurrently, then write the manifest.
-    def run(self) -> None:
-        if refusal := _symlink_refusal("pack.mcmeta", "read"):
-            raise SystemExit(str(refusal))
-        if not os.path.isfile("pack.mcmeta"):
-            raise SystemExit("No pack.mcmeta found in the current directory.")
-        with _open("pack.mcmeta") as f:
-            try:
-                pack_meta: dict[str, object] = json.load(f)
-            except json.JSONDecodeError as err:
-                raise SystemExit(f"pack.mcmeta is not valid JSON: {err}") from err
-
-        self._pack_format = self._read_pack_format(pack_meta)
-        self._pack_name = os.path.basename(os.getcwd())
-        if set(self._pack_name) - _FUNCTION_NAME_CHARS:
-            tui.log_error(
-                BLSyntaxError(f"The datapack directory name '{self._pack_name}' may only use a-z, 0-9, '_' and '-'.")
-            )
-
-        if refusal := _symlink_refusal("data", "read"):
-            tui.log_error(refusal)
+            error = BLFileError(f"Failed to delete stale file '{filepath}': {err.strerror or err}.")
+            self._report_error(local_path, error)
             return
-        if not os.path.isdir("data"):
-            return
+        self._deleted.add(filepath)
 
-        self._previous_manifest = self._read_manifest()
-
-        discovered: dict[str, str] = {}  # local_path -> namespace
-        for namespace in sorted(os.listdir("data")):
-            namespace_dir = os.path.join("data", namespace)
-            if refusal := _symlink_refusal(namespace_dir, "read namespace"):
-                tui.log_error(refusal)
-                continue
-            if not os.path.isdir(namespace_dir):
-                continue
-            if set(namespace) - _FUNCTION_NAME_CHARS:
-                tui.log_error(BLSyntaxError(f"The namespace '{namespace}' may only use a-z, 0-9, '_' and '-'."))
-                continue
-            blocklight_dir = os.path.join(namespace_dir, "blocklight")
-            for local_path in self._iter_bl_files(blocklight_dir):
-                discovered[local_path] = namespace
-
-        # Sources present in the last manifest but not found this run: their outputs are orphaned.
-        previous_manifest = self._previous_manifest
-        if not tui.get_dry_run() and previous_manifest is not None:
-            for local_path in sorted(set(previous_manifest.sources) - set(discovered)):
-                for output in previous_manifest.sources[local_path].outputs:
-                    self.delete_stale_output(output, local_path)
-
-        with ThreadPoolExecutor() as executor:
-            futures = {
-                executor.submit(Compile(local_path, namespace).compile): local_path
-                for local_path, namespace in discovered.items()
-            }
-            for future, local_path in futures.items():
+    # Remove folders left empty by deleted files, up to but not including data/.
+    def _prune_empty_dirs(self) -> None:
+        for directory in sorted({os.path.dirname(path) for path in self._deleted}, key=len, reverse=True):
+            while directory and os.path.normpath(directory) != "data":
                 try:
-                    future.result()
-                except Exception as err:  # a bug or unanticipated failure must not vanish silently
-                    self.report_error(local_path, BLFileError(f"Unexpected error while compiling: {err}"))
+                    os.rmdir(directory)  # fails unless empty
+                except OSError:
+                    break
+                directory = os.path.dirname(directory)
 
-        self.wait_for_writes()
-        if not tui.get_dry_run():
-            self._write_manifest()
-
-    # Writes output file to disk.
-    def _persist_file(self, filepath: str, contents: str, function_def_line: _Line, local_path: str) -> None:
-        if refusal := _symlink_refusal(filepath, "write"):
-            refusal.lineno, refusal.text = function_def_line.lineno, function_def_line.text
-            self.report_error(local_path, refusal)
+    # Write the load function creating the reserved scoreboard objective and register it.
+    def _write_setup_function(self, producers: dict[str, list[tuple[str, _Line | None]]]) -> None:
+        path = self._SETUP_FUNCTION_FILEPATH
+        if sources := producers.get(os.path.normpath(path)):
+            for local_path, line in sources:
+                self._report_error(local_path, BLFileError(f"The path '{path}' is reserved for Blocklight.", line))
             return
         try:
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            with _open(filepath, "x") as f:
-                f.write(contents)
-        except FileExistsError:
-            err = BLFileError(f"Another function already compiles to '{filepath}'.", function_def_line)
-            self.report_error(local_path, err)
+            outcome = self._write_output(path, Compile.setup_function_contents())
+        except BLFileError as err:
+            self._log_error(err)
             return
-        except OSError as ose:
-            err = BLFileError(f"Failed to write '{filepath}': {ose.strerror}.", function_def_line)
-            self.report_error(local_path, err)
+        self._count_write(outcome)
+        self._files.add(path)
+        self._result.load_functions.add(path)
+
+    # Delete the setup function, unless it lacks the Blocklight header. A dry run only counts it.
+    def _delete_setup_function(self) -> None:
+        path = self._SETUP_FUNCTION_FILEPATH
+        try:
+            existing = self._read_text(path, "delete")
+            if existing is not None and Compile.HEADER_MARKER in existing:
+                if not self._options.dry_run:
+                    os.remove(path)
+                self._deleted.add(path)
+        except BLFileError as err:
+            self._log_error(err)
+        except OSError as err:
+            self._log_error(BLFileError(f"Failed to delete '{path}': {err.strerror or err}."))
+
+    # Update the load and tick function tags.
+    def _write_function_tags(self) -> None:
+        previous = self._previous_manifest
+        for tag, outputs, previous_ids in (
+            ("load", self._result.load_functions, previous.load if previous else frozenset[str]()),
+            ("tick", self._result.tick_functions, previous.tick if previous else frozenset[str]()),
+        ):
+            path = f"{self._FUNCTION_TAG_DIR}/{tag}.json"
+            ids = self._tag_function_ids(outputs)
+            try:
+                self._update_function_tag(path, ids, previous_ids)
+            except BLFileError as err:
+                # The manifest records only this run's ids, so the next run won't remove entries dropped this run.
+                # Current ids are re-added by the next run once the tag is fixed.
+                if dropped := sorted(previous_ids.difference(ids)):
+                    entries = ", ".join(f"'{function_id}'" for function_id in dropped)
+                    err = BLFileError(
+                        f"{err} Orphaned entries {entries} remain in '{path}'. Please manually clean up this file."
+                    )
+                self._log_error(err)
+
+    # Rewrite the function tag at `path`: drop entries for `previous_ids` and `ids`, then append `ids`, keeping
+    # everything else. Creates the file only if there is an id to add.
+    def _update_function_tag(self, path: str, ids: list[str], previous_ids: frozenset[str]) -> None:
+        text = self._read_text(path, "update function tag", writable=True)
+        if text is None and not ids:
             return
-        # Mutated from many write-pool threads; relies on the GIL for these single-op updates.
-        self._files.add(filepath)
-        self._source_outputs.setdefault(local_path, set()).add(filepath)
-        tui.tick_written()
+        raw: object = {} if text is None else self._parse_json(path, text)
+        if not isinstance(raw, dict):
+            raise BLFileError(f"Malformed function tag '{path}': must be a JSON object.")
+        tag_json = cast(dict[str, object], raw)
+        values = tag_json.get("values", [])
+        if not isinstance(values, list):
+            raise BLFileError(f"Malformed function tag '{path}': 'values' must be a list.")
+
+        owned = previous_ids.union(ids)
+        new_values = [entry for entry in cast(list[object], values) if self._tag_entry_id(entry) not in owned] + ids
+        if "values" not in tag_json or new_values != values:
+            tag_json["values"] = new_values
+            self._write_text(path, json.dumps(tag_json, indent=2), "update function tag")
+
+    # Sorted ids of `outputs` that were written, the setup function first so other load functions can use
+    # the reserved objective. A tag naming a missing function fails to load.
+    def _tag_function_ids(self, outputs: set[str]) -> list[str]:
+        setup_id = self._function_id(self._SETUP_FUNCTION_FILEPATH)
+        ids = (self._function_id(output) for output in outputs & self._files)
+        return sorted(ids, key=lambda function_id: (function_id != setup_id, function_id))
+
+    # Id of a function tag entry: a bare string or an {"id": ...} object. None if neither.
+    @staticmethod
+    def _tag_entry_id(entry: object) -> str | None:
+        if isinstance(entry, dict):
+            entry = cast(dict[str, object], entry).get("id")
+        return entry if isinstance(entry, str) else None
+
+    # Load the previous run's manifest, or None if there is none. Outside a dry run, also opens (or creates) it for
+    # the final write, so an unwritable manifest stops the run before any file changes. Raises BLFileError if the
+    # manifest is unusable.
+    def _read_manifest(self) -> _Manifest | None:
+        path = self._MANIFEST_FILENAME
+        if self._options.dry_run:
+            text = self._read_text(path, "read manifest")
+        else:
+            if self._options.no_symlink and _contains_symlink(path, self._pack_root_dir):
+                raise BLFileError(f"Refusing to open manifest '{path}': the path contains a symlink.")
+            try:
+                try:
+                    self._manifest_file = self._open_symlink_safe(path, "r+")
+                except FileNotFoundError:
+                    self._manifest_file = self._open_symlink_safe(path, "x+")
+                text = self._manifest_file.read()
+            except OSError as err:
+                raise BLFileError(f"Failed to read and write '{path}': {err.strerror or err}.") from err
+            except UnicodeDecodeError as err:
+                raise BLFileError(f"Failed to read and write '{path}': {err}.") from err
+        if text is None or not text.strip():  # missing, just created, or a crash interrupted the last write
+            return None
+        try:
+            return self._parse_manifest(path, text)
+        except BLFileError as err:
+            raise BLFileError(f"{err} Delete '{path}' to rebuild from scratch.") from err
+
+    # Manifest from its JSON `text`. Missing fields read as empty. Raises BLFileError if malformed.
+    def _parse_manifest(self, path: str, text: str) -> _Manifest:
+        root = self._manifest_dict(self._parse_json(path, text), "manifest")
+        sources: dict[str, _ManifestSourceEntry] = {}
+        for local_path, value in self._manifest_dict(root.get("sources", {}), "sources").items():
+            where = f"sources.{local_path}"
+            entry = self._manifest_dict(value, where)
+            source_hash = entry.get("source_hash", "")
+            if not isinstance(source_hash, str):
+                self._log_bad_manifest_field(f"{where}.source_hash", "a string")
+                source_hash = ""
+            sources[local_path] = _ManifestSourceEntry(
+                source_hash=source_hash,
+                outputs=self._manifest_str_set(entry.get("outputs", []), f"{where}.outputs"),
+            )
+
+        version = self._version_pair(root.get("version", [0, 0]))
+        if version is None:
+            self._log_bad_manifest_field("version", "a [major, minor] pair")
+            version = (0, 0)
+        return _Manifest(
+            sources=sources,
+            load=self._manifest_str_set(root.get("load", []), "load"),
+            tick=self._manifest_str_set(root.get("tick", []), "tick"),
+            version=version,
+        )
+
+    # Write this run's manifest through the handle opened by _read_manifest, then close it.
+    def _write_manifest(self) -> None:
+        sources: dict[str, dict[str, object]] = {}
+        for local_path, content_hash in self._source_hashes.items():
+            outputs = self._source_outputs.get(local_path, {})
+            sources[local_path] = {"outputs": sorted(outputs.keys() - self._failed_writes)}
+            if local_path not in self._needs_recompile:  # a missing hash forces a recompile next run
+                sources[local_path]["source_hash"] = content_hash
+        manifest = {
+            "version": list(_BL_VERSION),
+            "load": self._tag_function_ids(self._result.load_functions),
+            "tick": self._tag_function_ids(self._result.tick_functions),
+            "sources": sources,
+        }
+
+        manifest_file = self._manifest_file
+        assert manifest_file is not None
+        try:
+            with manifest_file:
+                manifest_file.seek(0)
+                manifest_file.truncate()
+                json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+        except OSError as err:
+            self._log_error(
+                BLFileError(f"Failed to write manifest '{self._MANIFEST_FILENAME}': {err.strerror or err}.")
+            )
 
     def _read_pack_format(self, pack_meta: dict[str, object]) -> int | None:
         pack_obj = pack_meta.get("pack")
@@ -584,39 +804,46 @@ class Orchestration:
             elif "supported_formats" in pack:
                 value = pack["supported_formats"]
 
-        if isinstance(value, list):
-            numeric_items = [item for item in cast(list[object], value) if isinstance(item, (int, float))]
-            value = min(numeric_items) if numeric_items else None
+        if isinstance(value, dict):
+            value = cast(dict[str, object], value).get("min_inclusive")
+        if isinstance(value, list) and value:
+            value = cast(list[object], value)[0]
 
-        if not isinstance(value, int | float):
-            tui.log_error(
-                BLSyntaxError("pack.mcmeta must declare 'min_format', 'pack_format', or 'supported_formats'.")
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            self._log_error(
+                BLSyntaxError(
+                    "The file 'pack.mcmeta' must declare 'min_format', 'pack_format', or 'supported_formats'."
+                )
             )
             return None
-        return int(value)  # truncates a major.minor string to major int
+        return int(value)
 
+    # `value` as a JSON object, else raise BLFileError naming manifest field `where`.
     @staticmethod
-    def _str_set(value: object) -> frozenset[str]:
-        if not isinstance(value, list):
-            return frozenset()
-        return frozenset(item for item in cast(list[object], value) if isinstance(item, str))
+    def _manifest_dict(value: object, where: str) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise BLFileError(f"Malformed manifest: '{where}' must be an object.")
+        return cast(dict[str, object], value)
 
+    # `value` as a set of strings, else raise BLFileError naming manifest field `where`.
     @staticmethod
-    def _version_pair(value: object) -> tuple[int, int]:
+    def _manifest_str_set(value: object, where: str) -> frozenset[str]:
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in cast(list[object], value)):
+            raise BLFileError(f"Malformed manifest: '{where}' must be a list of strings.")
+        return frozenset(cast(list[str], value))
+
+    # Log a malformed manifest field whose fallback value only forces a recompile.
+    def _log_bad_manifest_field(self, where: str, expected: str) -> None:
+        self._log_error(BLFileError(f"Malformed manifest: '{where}' must be {expected}. Recompiling."))
+
+    # `value` as a (major, minor) pair, or None if malformed.
+    @staticmethod
+    def _version_pair(value: object) -> tuple[int, int] | None:
         if isinstance(value, list):
             parts = cast(list[object], value)
-            if len(parts) == 2 and all(isinstance(part, int) for part in parts):
+            if len(parts) == 2 and all(type(part) is int for part in parts):  # rejects bool
                 return (cast(int, parts[0]), cast(int, parts[1]))
-        return (0, 0)
-
-    # Whether `filepath` normalizes to a path inside data/<namespace>/function. Rejects malformed namespaces.
-    @staticmethod
-    def _in_function_dir(filepath: str, namespace: str) -> bool:
-        if not namespace or set(namespace) - _FUNCTION_NAME_CHARS:
-            return False
-        expected_root = os.path.normpath(f"data/{namespace}/function")
-        normalized = os.path.normpath(filepath)
-        return normalized == expected_root or normalized.startswith(expected_root + os.sep)
+        return None
 
     # Convert "data/<namespace>/function/<filepath_remainder>.mcfunction" to "<namespace>:<filepath_remainder>"
     @staticmethod
@@ -624,77 +851,54 @@ class Orchestration:
         _data, namespace, _function, *rest = filepath.split("/")
         return f"{namespace}:{'/'.join(rest).removesuffix('.mcfunction')}"
 
-    # Load the previous run's manifest, if any. A missing or corrupt manifest is treated as empty.
-    def _read_manifest(self) -> _Manifest | None:
-        if refusal := _symlink_refusal(self._MANIFEST_FILENAME, "read manifest"):
-            tui.log_error(refusal)
-            return None
+    # Contents of `path`, or None if it does not exist. Raises BLFileError if it cannot be read, or with
+    # `writable`, if it cannot be written.
+    def _read_text(self, path: str, action: str, writable: bool = False) -> str | None:
+        if self._options.no_symlink and _contains_symlink(path, self._pack_root_dir):
+            raise BLFileError(f"Refusing to {action} '{path}': the path contains a symlink.")
+        access = "read and write" if writable else "read"
         try:
-            with _open(self._MANIFEST_FILENAME) as f:
-                raw: object = json.load(f)
-        except (OSError, json.JSONDecodeError):
+            with self._open_symlink_safe(path, "r+" if writable else "r") as f:
+                return f.read()
+        except FileNotFoundError:
             return None
-        if not isinstance(raw, dict):
-            return None
-        raw_dict = cast(dict[str, object], raw)
+        except OSError as err:
+            raise BLFileError(f"Failed to {access} '{path}': {err.strerror or err}.") from err
+        except UnicodeDecodeError as err:
+            raise BLFileError(f"Failed to {access} '{path}': {err}.") from err
 
-        sources: dict[str, _ManifestSourceEntry] = {}
-        sources_raw = raw_dict.get("sources")
-        if isinstance(sources_raw, dict):
-            for local_path, value in cast(dict[str, object], sources_raw).items():
-                if not isinstance(value, dict):
-                    continue
-                entry = cast(dict[str, object], value)
-                source_hash = str(entry.get("source_hash"))  # str cast needed for typing
-                sources[local_path] = _ManifestSourceEntry(
-                    source_hash=source_hash,
-                    outputs=self._str_set(entry.get("outputs")),
-                    needs_recompile=bool(entry.get("needs_recompile")),
-                )
-        return _Manifest(
-            sources=sources,
-            load=self._str_set(raw_dict.get("load")),
-            tick=self._str_set(raw_dict.get("tick")),
-            version=self._version_pair(raw_dict.get("version")),
-        )
+    # Parsed JSON of `text`, else raise BLFileError naming `path`.
+    @staticmethod
+    def _parse_json(path: str, text: str) -> object:
+        try:
+            return json.loads(text)
+        except (ValueError, RecursionError) as err:
+            raise BLFileError(f"Malformed JSON in '{path}': {err}.") from err
 
-    # Persist this run's manifest (info on this compile)
-    def _write_manifest(self) -> None:
-        manifest = {
-            "version": list(_BL_VERSION),
-            "load": sorted(self._function_id(output) for output in self._load_functions),
-            "tick": sorted(self._function_id(output) for output in self._tick_functions),
-            "sources": {
-                local_path: {
-                    "source_hash": content_hash,
-                    "outputs": sorted(self._source_outputs.get(local_path, set())),
-                    "needs_recompile": local_path in self._needs_recompile,
-                }
-                for local_path, content_hash in self._source_hashes.items()
-            },
-        }
-        if refusal := _symlink_refusal(self._MANIFEST_FILENAME, "write manifest"):
-            tui.log_error(refusal)
-            return
-        with _open(self._MANIFEST_FILENAME, "w") as f:
-            json.dump(manifest, f, indent=2, sort_keys=True)
+    # Write `contents` to `path`, creating parent directories. Raises BLFileError on failure.
+    def _write_text(self, path: str, contents: str, action: str) -> None:
+        if self._options.no_symlink and _contains_symlink(path, self._pack_root_dir):
+            raise BLFileError(f"Refusing to {action} '{path}': the path contains a symlink.")
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with self._open_symlink_safe(path, "w") as f:
+                f.write(contents)
+        except OSError as err:
+            raise BLFileError(f"Failed to write '{path}': {err.strerror or err}.") from err
 
     # Yield .bl paths under blocklight_dir. With no_symlink, refuses to follow symlinked
     # directories or read symlinked files, logging a recoverable error for each one skipped.
     def _iter_bl_files(self, blocklight_dir: str) -> Iterator[str]:
-        no_symlink = tui.get_no_symlink()
-        if refusal := _symlink_refusal(blocklight_dir, "read"):  # os.walk follows a symlinked top regardless
-            tui.log_error(refusal)
+        if self._options.no_symlink and _contains_symlink(blocklight_dir, self._pack_root_dir):
+            self._log_error(BLFileError(f"Refusing to read '{blocklight_dir}': the path contains a symlink."))
             return
-        for root, dirs, files in os.walk(blocklight_dir, followlinks=not no_symlink):
-            if no_symlink:
+        for root, dirs, files in os.walk(blocklight_dir, followlinks=not self._options.no_symlink):
+            if self._options.no_symlink:
                 kept_dirs: list[str] = []
                 for d in dirs:
                     full = os.path.join(root, d)
-                    if _is_link(full):
-                        tui.log_error(
-                            BLFileError(f"Refusing to follow symlinked directory '{full}' (--no-symlink is set).")
-                        )
+                    if _contains_symlink(full, self._pack_root_dir):
+                        self._log_error(BLFileError(f"Refusing to follow '{full}': the path contains a symlink."))
                     else:
                         kept_dirs.append(d)
                 dirs[:] = kept_dirs
@@ -703,15 +907,19 @@ class Orchestration:
                 if not name.endswith(".bl"):
                     continue
                 path = os.path.join(root, name)
-                if no_symlink and _is_link(path):
-                    tui.log_error(
-                        BLFileError(f"Refusing to read symlinked source file '{path}' (--no-symlink is set).")
-                    )
+                if self._options.no_symlink and _contains_symlink(path, self._pack_root_dir):
+                    self._log_error(BLFileError(f"Refusing to read '{path}': the path contains a symlink."))
                     continue
-                yield path
+                yield path.replace(os.sep, "/")  # same manifest keys on every OS
+
+    # Fails file open if a symlink must be traversed. New files get 0o666 like open(), so the umask decides.
+    def _open_symlink_safe(self, path: str, mode: str = "r") -> IO[str]:
+        no_follow = getattr(os, "O_NOFOLLOW", 0) if self._options.no_symlink else 0
+        return open(path, mode, encoding="utf-8", opener=lambda p, flags: os.open(p, flags | no_follow, 0o666))
 
 
-# One instance per bl source file, constructed and run inside Orchestration's discovery pool.
+# Compiles one bl source file into the contents of its outputs. Never touches the disk: Pack reads the source and
+# writes the outputs.
 class Compile:
     _FUNCTION_HEADER_KEYWORDS = frozenset(("root", "load", "tick"))
     _MACRO_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_")
@@ -738,12 +946,7 @@ class Compile:
     _BL_RETURNING_HOLDER = "#_bl_returning"
     _BL_SUCCESS_HOLDER = "#_bl_return_success"
     _BL_VALUE_HOLDER = "#_bl_return_value"
-    _BL_COND_HOLDER = "#_bl_cond"  # 2 = macro substitution failed (preset), 1 = true, 0 = false
-
-    # ----- Conditions ----- #
-    _BL_DEBUG_TAG = "_bl_debug"  # players with this tag see runtime errors
-    _COND_MAX_CLAUSES = 64  # max clauses from distributing macro-bearing 'or'
-    _COND_OPERATORS = frozenset(("and", "or", "not"))
+    _BL_COND_HOLDER = "#_bl_cond"  # 1 = true, 0 = false (a failed helper call stores 0)
 
     # ----- Compiled output strings ----- #
     HEADER_MARKER = "Compiled by Blocklight"
@@ -751,65 +954,46 @@ class Compile:
         f"# {HEADER_MARKER} {_BL_VERSION_STRING} (https://github.com/qcjames53/blocklight)",
         "# Changes saved to this file will not persist. Please modify the bl source file instead:",
     ]
-    # Catch that a child function returned, get return success and value then forward up the call chain
-    _RET_HANDLER_FULL: ClassVar[list[str]] = [
-        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return run scoreboard players get {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}",  # noqa: E501
-        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 if score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 0 run return fail",  # noqa: E501
+    # A 'return' below a function's own level holds its result, sets #_bl_returning, and exits its helper. Each caller
+    # forwards it up; the function's return_handler clears #_bl_returning and returns the held result. So the flag is
+    # only ever 1 while a return climbs out of one function.
+    _RET_VALUE = f"{_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD}"
+    _RET_SUCCESS = f"{_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD}"
+    _RET_RETURNING = f"{_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD}"
+    # Mark the function as returning and exit this helper
+    _RET_MARK_AND_EXIT = f"return run scoreboard players set {_RET_RETURNING} 1"
+    # After a call to a child that may return, below the function's own level: forward the return up one level
+    _RET_FORWARD = f"execute if score {_RET_RETURNING} matches 1 run return 0"
+    # Body of <function>_helper/return_handler: end the return and give the function the held result
+    _RET_HANDLER_LINES: ClassVar[list[str]] = [
+        f"scoreboard players set {_RET_RETURNING} 0",
+        f"execute if score {_RET_SUCCESS} matches 0 run return fail",
+        f"return run scoreboard players get {_RET_VALUE}",
     ]
-    # Catch that a child function returned and also return this function. Used as optimized middleman in call stack.
-    _RET_HANDLER_PARTIAL: ClassVar[list[str]] = [
-        f"execute if score {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} matches 1 run return 0"
-    ]
-    # Mark that child method decided to return
-    _RET_MARK_RETURNING = f"scoreboard players set {_BL_RETURNING_HOLDER} {_BL_RESERVED_SCOREBOARD} 1"
-    # Set the return success and value holders and return something
-    _RET_SET_HOLDERS = f"execute store result score {_BL_VALUE_HOLDER} {_BL_RESERVED_SCOREBOARD} store success score {_BL_SUCCESS_HOLDER} {_BL_RESERVED_SCOREBOARD} run return "  # noqa: E501
 
-    def __init__(self, local_path: str, namespace: str) -> None:
-        self._local_path = local_path
-        self._namespace = namespace
+    def __init__(self, source: SourceFile, pack: _PackInfo) -> None:
+        self._source = source
+        self._pack = pack
+        self._indent = "  "  # one indentation level, detected by compile()
+        self._compiled = CompiledSource()
+        self._helper_counts: dict[tuple[str, str], int] = {}  # (output function, helper kind) -> helpers named
 
-    # Reads the bl source file, determines if compile is needed, then deletes old output and recompiles
-    def compile(self) -> None:
+    # Compile every function in the source, isolating recoverable errors to the function that raised them.
+    def compile(self) -> CompiledSource:
         try:
-            sf = SourceFile(self._local_path, self._namespace)
-        except BLFileError:
-            return
-        content_hash = sf.content_hash
-
-        previous_entry = orchestration.get_previous_manifest_entry(self._local_path)
-        orchestration.record_source(self._local_path, content_hash)
-        previous_compiler_version = orchestration.get_previous_compiler_version()
-
-        # Skip recompile of already-compiled files under circumstances considered safe
-        if (
-            not _BL_IS_DEV_BUILD
-            and not tui.get_force()
-            and previous_compiler_version == _BL_VERSION
-            and previous_entry is not None
-            and previous_entry.source_hash == content_hash
-        ):
-            for output in previous_entry.outputs:
-                orchestration.reuse_output_file(self._local_path, output)
-            return
-
-        if previous_entry is not None and not tui.get_dry_run():
-            for output in previous_entry.outputs:
-                orchestration.delete_stale_output(output, self._local_path)
-
-        # Compile every function in `sf`, isolating recoverable errors to the function that raised them.
-        try:
-            for function_lines in self._iter_spans(sf.source_lines, self._single_indent(sf), 0):
+            self._indent = self._single_indent(self._source.source_lines)
+            for function_lines in self._iter_spans(self._source.source_lines, 0):
                 try:
-                    self._compile_function(sf, function_lines)
+                    self._compile_function(function_lines)
                 except BLNonFatalError as err:
-                    orchestration.report_error(sf.local_path, err)
+                    self._compiled.errors.append(err)
         except BLFatalError as err:
-            orchestration.report_error(sf.local_path, err)
+            self._compiled.errors.append(err)
+        return self._compiled
 
     @staticmethod
-    def _single_indent(sf: SourceFile) -> str:
-        for line in sf.source_lines:
+    def _single_indent(lines: list[_Line]) -> str:
+        for line in lines:
             indent = line.text[: len(line.text) - len(line.text.lstrip())]
             if not indent:
                 continue
@@ -823,9 +1007,8 @@ class Compile:
         return "  "
 
     # Yield lists of _Line objects for each command / block encountered at provided depth.
-    @staticmethod
-    def _iter_spans(lines: list[_Line], single_indent: str, depth: int) -> Iterator[list[_Line]]:
-        indent = "" if depth == 0 else single_indent * depth
+    def _iter_spans(self, lines: list[_Line], depth: int) -> Iterator[list[_Line]]:
+        indent = "" if depth == 0 else self._indent * depth
         indent_len = len(indent)
 
         if lines and lines[0].text[indent_len : indent_len + 1].isspace():  # first line must sit at this depth
@@ -851,24 +1034,35 @@ class Compile:
         namespace, path = function_name.split(":", 1)
         return f"data/{namespace}/function/{path}.mcfunction"
 
-    # Header lines every compiled output file (including helpers) begins with.
-    @staticmethod
-    def _header_lines(local_path: str, lineno: int) -> list[str]:
-        return [*Compile._HEADER_TEXT, f"#     `{local_path}:{lineno}`"]
+    # Name the next helper of `kind` (e.g. "as") under output function `function_name`: "<function_name>_helper/as_0",
+    # then as_1. Numbering is per output function, including blocks a python block emits into it.
+    def _helper_name(self, function_name: str, kind: str) -> str:
+        index = self._helper_counts.get((function_name, kind), 0)
+        self._helper_counts[(function_name, kind)] = index + 1
+        return f"{function_name}_helper/{kind}_{index}"
 
-    # Write `block_out` as the output file of `function_name`.
+    # Header lines every compiled output file (including helpers) begins with.
+    def _header_lines(self, lineno: int) -> list[str]:
+        return [*self._HEADER_TEXT, f"#     `{self._source.local_path}:{lineno}`"]
+
+    # Contents of the load function that creates the reserved scoreboard objective.
     @staticmethod
-    def _write_function(function_name: str, block_out: _BlockOutput, line: _Line, local_path: str) -> None:
-        orchestration.write_output_file(
-            Compile._function_filepath(function_name),
-            "\n".join(block_out.lines),
-            line,
-            local_path,
-            function_name.split(":", 1)[0],
-        )
+    def setup_function_contents() -> str:
+        return f"{Compile._HEADER_TEXT[0]}\nscoreboard objectives add {Compile._BL_RESERVED_SCOREBOARD} dummy"
+
+    # Record `block_out` as the output file of `function_name`, defined at `line`.
+    # Raises BLFileError for a path outside the namespace or one this source already compiles to.
+    def _add_output(self, function_name: str, block_out: _BlockOutput, line: _Line) -> None:
+        filepath = self._function_filepath(function_name)
+        namespace = function_name.split(":", 1)[0]
+        if not _in_function_dir(filepath, namespace):
+            raise BLFileError(f"Output path '{filepath}' escapes namespace '{namespace}'.", line)
+        if filepath in self._compiled.mcf_outputs:
+            raise BLFileError(f"Another function already compiles to '{filepath}'.", line)
+        self._compiled.mcf_outputs[filepath] = _MCFOutputContents("\n".join(block_out.lines), line)
 
     # Validate a function header and compile its body to an mcfunction file.
-    def _compile_function(self, sf: SourceFile, lines: list[_Line]) -> None:
+    def _compile_function(self, lines: list[_Line]) -> None:
         header = lines[0]
         header_split = header.text.split("function ")
         if len(header_split) <= 1:
@@ -884,7 +1078,7 @@ class Compile:
         seen_keywords: set[str] = set()
         for word in header_split[0].split():
             if word not in self._FUNCTION_HEADER_KEYWORDS:
-                raise BLSyntaxError(f"This function definition declares an unknown keyword: '{word}'", header)
+                raise BLSyntaxError(f"This function definition declares an unknown keyword: '{word}'.", header)
             if word in seen_keywords:
                 raise BLSyntaxError(f"This function definition declares '{word}' twice.", header)
             seen_keywords.add(word)
@@ -893,62 +1087,69 @@ class Compile:
         function_name, is_root, is_load, is_tick = header.as_function_header()
         if not function_name:
             raise BLSyntaxError(
-                "This function definition does not declare a function name (e.g. 'function foo')", header
+                "This function definition does not declare a function name (e.g. 'function foo').", header
             )
         if sorted(set(function_name) - _FUNCTION_NAME_CHARS):
-            raise BLSyntaxError("Function names may only use a-z, 0-9, '_' and '-'", header)
+            raise BLSyntaxError(f"The function name '{function_name}' may only use a-z, 0-9, '_' and '-'.", header)
 
         # Validate function actually has contents. No output otherwise.
         if len(lines) == 1:
             return
 
-        # Determine output filepath
-        _data, namespace, _src_root, *subdirs, source_file = sf.local_path.split("/")  # /data/<ns>/blocklight/*/f.bl
+        # Determine output filepath from the source path, data/<ns>/blocklight/*/f.bl
+        _data, namespace, _src_root, *subdirs, source_file = self._source.local_path.split("/")
         if is_root:
             function_path = function_name
         else:
             function_path = "/".join([*subdirs, source_file.removesuffix(".bl"), function_name])
-        block_in = _BlockInput(sf, function_name, f"{namespace}:{function_path}")
+        block_in = _BlockInput(function_name, f"{namespace}:{function_path}", 1)
         output_filepath = self._function_filepath(block_in.function_name)
+        # Checked before its helpers continue the earlier function's numbering
+        if output_filepath in self._compiled.mcf_outputs:
+            raise BLFileError(f"Another function already compiles to '{output_filepath}'.", header)
 
         # Build function and helpers
         block_out = _BlockOutput()
-        block_out.lines.extend(self._header_lines(sf.local_path, header.lineno))
-        self._compile_lines(block_in, block_out, lines[1:], 1)
-        if block_out.can_return:
-            # If compiled lines can return, reset the "is currently returning" flag on function call
-            block_out.lines.insert(
-                len(self._HEADER_TEXT) + 1,  # Insert after header text
-                f"scoreboard players set {self._BL_RETURNING_HOLDER} {self._BL_RESERVED_SCOREBOARD} 0",
-            )
+        block_out.lines.extend(self._header_lines(header.lineno))
+        self._compile_lines(block_in, block_out, lines[1:])
+        if block_out.can_return:  # a return below this level climbs to the function's return handler
+            handler_out = _BlockOutput()
+            handler_out.lines.extend(self._header_lines(header.lineno))
+            handler_out.lines.extend(self._RET_HANDLER_LINES)
+            self._add_output(self._return_handler_name(block_in.function_name), handler_out, header)
 
         # Write output file to disk
-        self._write_function(block_in.function_name, block_out, header, sf.local_path)
+        self._add_output(block_in.function_name, block_out, header)
         if is_load:
-            orchestration.register_load_function(output_filepath)
+            self._compiled.load.add(output_filepath)
         if is_tick:
-            orchestration.register_tick_function(output_filepath)
+            self._compiled.tick.add(output_filepath)
 
-    # Compile the commands in `lines` (at `depth`) + recursively compile child blocks
-    def _compile_lines(self, block_in: _BlockInput, block_out: _BlockOutput, lines: list[_Line], depth: int) -> None:
-        counts: dict[str, int] = {}  # Local dict holding # of times each block header is used to name a helper method
-
-        # In-progress if/elif*/else? chain, accumulated one span at a time and compiled as a unit
-        # the moment a span other than a continuing 'elif'/'else' is seen (or spans run out).
-        pending_chain: list[tuple[str, str, list[_Line]]] = []
+    # Compile the commands in `lines` (at `depth`) to an output mcfunction + recursively compile child blocks.
+    def _compile_lines(self, block_in: _BlockInput, block_out: _BlockOutput, lines: list[_Line]) -> None:
+        pending_chain: list[tuple[str, str, list[_Line]]] = []  # In progress if-chain
 
         # Iterate over commands and block headers at depth
         # Spans are a list of one header _Line + child _Lines at greater indentation
-        for span in self._iter_spans(lines, self._single_indent(block_in.sf), depth):
+        # Each python block pushes an iterator over its output's spans, read before the spans after the block
+        span_iters = [self._iter_spans(lines, block_in.depth)]
+        while span_iters:
+            span = next(span_iters[-1], None)
+            if span is None:
+                span_iters.pop()
+                continue
             line = span[0]
             text = line.text.lstrip()  # right is already stripped
             has_body = len(span) > 1
             keyword, args = line.as_keyword_args()
             keyword_spec = self._BLOCK_KEYWORD_SPECS.get(keyword)
+            if keyword == "summon" and not has_body:  # without a block, 'summon' is the vanilla command
+                keyword_spec = None
 
-            # Anything other than a continuing 'elif'/'else' closes a pending if-chain first.
-            if keyword not in ("elif", "else") and pending_chain:
-                self._compile_if_chain(block_in, block_out, counts, pending_chain, depth)
+            # Anything other than a continuing 'elif'/'else' closes a pending if-chain.
+            # A python block's output may contain 'elif'/'else' so we inline expand before closing the chain.
+            if keyword not in ("elif", "else", "python") and pending_chain:
+                self._compile_if_chain(block_in, block_out, pending_chain)
                 pending_chain = []
 
             # Handle block keywords
@@ -958,22 +1159,20 @@ class Compile:
                 if args.startswith(" "):
                     raise BLSyntaxError("There are too many spaces between the keyword and the arguments.", line)
                 if keyword_spec.args_required and args == "":
-                    raise BLSyntaxError(f"'{keyword}' block requires arguments.")
+                    raise BLSyntaxError(f"This '{keyword}' block requires arguments.", line)
                 if not keyword_spec.args_required and args != "":
-                    raise BLSyntaxError(f"'{keyword}' block does not permit arguments.", line)
+                    raise BLSyntaxError(f"This '{keyword}' block does not permit arguments.", line)
 
                 match keyword_spec.type:
                     case _KeywordType.MODIFIER:
                         # Recursively compile this block into
                         # <current_function>_helper/<keyword>_<instance_of_this_keyword>.mcfunction
-                        keyword_count = counts.get(keyword, 0)  # Times this keyword has been used in this function
-                        counts[keyword] = keyword_count + 1
-                        child_function_name = f"{block_in.function_name}_helper/{keyword}_{keyword_count}"
-                        new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
+                        child_function_name = self._helper_name(block_in.function_name, keyword)
+                        new_block_in = block_in._replace(function_name=child_function_name, depth=block_in.depth + 1)
                         new_block_out = _BlockOutput()
-                        new_block_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
-                        self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
-                        self._write_function(child_function_name, new_block_out, line, block_in.sf.local_path)
+                        new_block_out.lines.extend(self._header_lines(line.lineno))
+                        self._compile_lines(new_block_in, new_block_out, span[1:])
+                        self._add_output(child_function_name, new_block_out, line)
 
                         # Determine what framework needs to be constructed around the child function call
                         macros_string = self._macros_forwarder(new_block_out.macros)  # Were macros used?
@@ -985,16 +1184,12 @@ class Compile:
                             ),
                         )
 
-                        # If the child function returns a value, immediately return.
-                        # Match success and return value if this is depth of 1 for proper propagation.
                         if new_block_out.can_return:
-                            block_out.can_return = True
-                            for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
-                                block_out.lines.append(handler_string)
+                            self._append_return_handler(block_in, block_out)
 
                     case _KeywordType.CONDITIONAL:
                         if keyword == "while":
-                            self._compile_while(block_in, block_out, counts, args, span, depth)
+                            self._compile_while(block_in, block_out, span)
                         elif keyword == "if":
                             pending_chain = [(keyword, args, span)]
                         else:  # 'elif' or 'else', continuing the chain just closed above if unrelated
@@ -1004,38 +1199,31 @@ class Compile:
                                 )
                             pending_chain.append((keyword, args, span))
                             if keyword == "else":  # 'else' always ends a chain
-                                self._compile_if_chain(block_in, block_out, counts, pending_chain, depth)
+                                self._compile_if_chain(block_in, block_out, pending_chain)
                                 pending_chain = []
 
                     case _KeywordType.INLINE_PYTHON:
-                        # Execute python (if permitted) and run emitted lines through this method recursively
-                        emitted = self._handle_python_block(block_in, span, depth)
-                        self._compile_lines(block_in, block_out, emitted, depth)
+                        # Execute python (if permitted); the lines it emits are compiled next, in place of this block
+                        emitted = self._handle_python_block(block_in, span)
+                        span_iters.append(self._iter_spans(emitted, block_in.depth))
 
             # Raise error on regular commands with body
             elif has_body:
                 raise BLSyntaxError("Only block keywords may begin an indented block.", span[1])
 
-            # Handle inline return commands
-            elif text.startswith("execute ") and text.find(" run return ") != -1:
+            # Handle inline return commands. At the function's own level they are vanilla returns already.
+            elif text.startswith("execute ") and " run return " in text and block_in.depth > 1:
                 split_result = text.split(" run return ")
                 if len(split_result) != 2:
-                    raise BLSyntaxError("This 'execute' statement contains a malformed 'return' command.")
+                    raise BLSyntaxError("This 'execute' statement contains a malformed 'return' command.", line)
                 execute_command, return_command_tail = split_result
 
-                return_count = counts.get("return", 0)
-                counts["return"] = return_count + 1
-
                 # Create a child helper file to call the inline return
-                child_filepath = f"{block_in.function_name}_helper/return_{return_count}"
+                child_function_name = self._helper_name(block_in.function_name, "return")
                 child_block_out = _BlockOutput()
-                child_block_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
-                child_block_out.lines.append(self._RET_MARK_RETURNING)
-                self._append_line_to_block_out(
-                    child_block_out,
-                    _Line(self._RET_SET_HOLDERS + return_command_tail, line.lineno),
-                )
-                self._write_function(child_filepath, child_block_out, line, block_in.sf.local_path)
+                child_block_out.lines.extend(self._header_lines(line.lineno))
+                self._append_nested_return(child_block_out, _Line(return_command_tail, line.lineno))
+                self._add_output(child_function_name, child_block_out, line)
 
                 # Call the helper inline, forcing return if it runs.
                 block_out.can_return = True
@@ -1043,41 +1231,63 @@ class Compile:
                 self._append_line_to_block_out(
                     block_out,
                     _Line(
-                        f"{execute_command} run return run function {child_filepath}{macros_string}",
+                        f"{execute_command} run return run function {child_function_name}{macros_string}",
                         line.lineno,
                     ),
                 )
 
-            # Handle regular return commands
-            elif text.startswith("return "):
-                block_out.can_return = True
-                return_command_tail = text[len("return ") :]
-                block_out.lines.append(self._RET_MARK_RETURNING)
-                self._append_line_to_block_out(
-                    block_out,
-                    _Line(self._RET_SET_HOLDERS + return_command_tail, line.lineno),
-                )
+            # Handle regular return commands. At the function's own level they are vanilla returns already.
+            elif text.startswith("return ") and block_in.depth > 1:
+                self._append_nested_return(block_out, _Line(text[len("return ") :], line.lineno))
 
             # Handle regular commands
             else:
                 self._append_line_to_block_out(block_out, line)
 
-        # A trailing chain (bare 'if', or 'if'/'elif'* with no 'else') never met a later span to
-        # close it above.
+        # Close any trailing if-chains at the end of the block.
         if pending_chain:
-            self._compile_if_chain(block_in, block_out, counts, pending_chain, depth)
+            self._compile_if_chain(block_in, block_out, pending_chain)
 
-    # Compile one if-elif-else chain
+    # Compile 'return <tail>' below the function's own level: hold the result, then mark and exit (see _RET_VALUE).
+    # The result is held before marking, so a function the tail calls can't clear the mark.
+    def _append_nested_return(self, block_out: _BlockOutput, tail: _Line) -> None:
+        block_out.can_return = True
+        if tail.text == "fail":
+            commands = [f"scoreboard players set {self._RET_SUCCESS} 0"]
+        elif tail.text.startswith("run "):
+            commands = [
+                f"scoreboard players set {self._RET_SUCCESS} 0",  # stays 0 if it runs a function that never returns
+                f"execute store result score {self._RET_VALUE} store success score {self._RET_SUCCESS} {tail.text}",
+            ]
+        else:
+            commands = [
+                f"scoreboard players set {self._RET_VALUE} {tail.text}",
+                f"scoreboard players set {self._RET_SUCCESS} 1",
+            ]
+        for command in [*commands, self._RET_MARK_AND_EXIT]:
+            self._append_line_to_block_out(block_out, _Line(command, tail.lineno))
+
+    # After a call to a child that may return: forward the return up a level, or at the function's own level, hand
+    # it to the function's return handler.
+    def _append_return_handler(self, block_in: _BlockInput, block_out: _BlockOutput) -> None:
+        block_out.can_return = True
+        if block_in.depth > 1:
+            block_out.lines.append(self._RET_FORWARD)
+        else:
+            handler_name = self._return_handler_name(block_in.function_name)
+            block_out.lines.append(
+                f"execute if score {self._RET_RETURNING} matches 1 run return run function {handler_name}"
+            )
+
+    @staticmethod
+    def _return_handler_name(function_name: str) -> str:
+        return f"{function_name}_helper/return_handler"
+
+    # Compile one if-elif-else chain.
     def _compile_if_chain(
-        self,
-        block_in: _BlockInput,
-        block_out: _BlockOutput,
-        counts: dict[str, int],
-        chain: list[tuple[str, str, list[_Line]]],
-        depth: int,
+        self, block_in: _BlockInput, block_out: _BlockOutput, chain: list[tuple[str, str, list[_Line]]]
     ) -> None:
-        chain_id = f"chain_{counts.get('if', 0)}"
-        counts["if"] = counts.get("if", 0) + 1
+        dispatcher_function_name = self._helper_name(block_in.function_name, "chain")  # also prefixes each branch
         if_line = chain[0][2][0]
 
         # Compile each branch's body recursively
@@ -1087,46 +1297,41 @@ class Compile:
             header_line = span[0]
             cond: _CompiledCondition | None = None
             if keyword == "if":
-                branch_name = f"{chain_id}_if"
-                cond = self._compile_condition(block_in, counts, args, header_line)
+                branch_name = "if"
+                cond = self._compile_condition(block_in, args, header_line)
             elif keyword == "elif":
-                branch_name = f"{chain_id}_elif_{elif_index}"
+                branch_name = f"elif_{elif_index}"
                 elif_index += 1
-                cond = self._compile_condition(block_in, counts, args, header_line)
+                cond = self._compile_condition(block_in, args, header_line)
             else:
-                branch_name = f"{chain_id}_else"
+                branch_name = "else"
 
-            child_function_name = f"{block_in.function_name}_helper/{branch_name}"
-            new_block_in = _BlockInput(block_in.sf, block_in.source_function_name, child_function_name)
+            child_function_name = f"{dispatcher_function_name}_{branch_name}"
+            new_block_in = block_in._replace(function_name=child_function_name, depth=block_in.depth + 1)
             new_block_out = _BlockOutput()
-            new_block_out.lines.extend(self._header_lines(block_in.sf.local_path, header_line.lineno))
-            self._compile_lines(new_block_in, new_block_out, span[1:], depth + 1)
-            self._write_function(child_function_name, new_block_out, header_line, block_in.sf.local_path)
+            new_block_out.lines.extend(self._header_lines(header_line.lineno))
+            self._compile_lines(new_block_in, new_block_out, span[1:])
+            self._add_output(child_function_name, new_block_out, header_line)
             branches.append((cond, child_function_name, new_block_out))
 
-        # Bare 'if' (single branch): call exactly like a modifier block, no dispatcher needed.
+        # Bare 'if' chains use a single execute command to run the compiled helper function.
         if len(branches) == 1:
             cond, child_function_name, branch_out = branches[0]
             assert cond is not None
             for setup_line in cond.setup_lines:
                 self._append_line_to_block_out(block_out, setup_line)
-            if cond.report_error_command is not None:  # before the body, which may reuse the holder
-                block_out.lines.append(self._condition_error_line(cond.report_error_command, exit_function=False))
             macros_string = self._macros_forwarder(branch_out.macros)
             self._append_line_to_block_out(
                 block_out,
                 _Line(f"execute {cond.subcommands} run function {child_function_name}{macros_string}", if_line.lineno),
             )
             if branch_out.can_return:
-                block_out.can_return = True
-                for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
-                    block_out.lines.append(handler_string)
+                self._append_return_handler(block_in, block_out)
             return
 
-        # Chains containing elif or else use a helper function.
-        dispatcher_function_name = f"{block_in.function_name}_helper/{chain_id}"
+        # Chains containing elif or else use an intermediate helper function to use return commands (fastest option).
         dispatcher_out = _BlockOutput()
-        dispatcher_out.lines.extend(self._header_lines(block_in.sf.local_path, if_line.lineno))
+        dispatcher_out.lines.extend(self._header_lines(if_line.lineno))
         for cond, child_function_name, branch_out in branches:
             macros_string = self._macros_forwarder(branch_out.macros)
             if cond is not None:  # 'if' / 'elif': only run (and exit the dispatcher) if the condition matches
@@ -1139,18 +1344,13 @@ class Compile:
                         if_line.lineno,
                     ),
                 )
-                # Macro substitution failure aborts the chain, skipping 'else'
-                if cond.report_error_command is not None:
-                    dispatcher_out.lines.append(
-                        self._condition_error_line(cond.report_error_command, exit_function=True)
-                    )
             else:  # 'else': unconditional, always last
                 self._append_line_to_block_out(
                     dispatcher_out, _Line(f"return run function {child_function_name}{macros_string}", if_line.lineno)
                 )
             if branch_out.can_return:
                 dispatcher_out.can_return = True
-        self._write_function(dispatcher_function_name, dispatcher_out, if_line, block_in.sf.local_path)
+        self._add_output(dispatcher_function_name, dispatcher_out, if_line)
 
         # Call the dispatcher unconditionally; it already decided which branch (if any) matched.
         macros_string = self._macros_forwarder(dispatcher_out.macros)
@@ -1159,40 +1359,29 @@ class Compile:
             _Line(f"function {dispatcher_function_name}{macros_string}", if_line.lineno),
         )
         if dispatcher_out.can_return:
-            block_out.can_return = True
-            for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
-                block_out.lines.append(handler_string)
+            self._append_return_handler(block_in, block_out)
 
     # Compile a while loop: the head helper tests the condition and tail-calls the body, which tail-calls the head.
-    def _compile_while(
-        self,
-        block_in: _BlockInput,
-        block_out: _BlockOutput,
-        counts: dict[str, int],
-        args: str,
-        span: list[_Line],
-        depth: int,
-    ) -> None:
+    def _compile_while(self, block_in: _BlockInput, block_out: _BlockOutput, span: list[_Line]) -> None:
         line = span[0]
-        loop_count = counts.get("while", 0)
-        counts["while"] = loop_count + 1
-        head_function_name = f"{block_in.function_name}_helper/while_{loop_count}"
+        _keyword, args = line.as_keyword_args()
+        head_function_name = self._helper_name(block_in.function_name, "while")
         body_function_name = f"{head_function_name}_body"
-        cond = self._compile_condition(block_in, counts, args, line)
+        cond = self._compile_condition(block_in, args, line)
 
-        body_in = _BlockInput(block_in.sf, block_in.source_function_name, body_function_name)
+        body_in = block_in._replace(function_name=body_function_name, depth=block_in.depth + 1)
         body_out = _BlockOutput()
-        body_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
-        self._compile_lines(body_in, body_out, span[1:], depth + 1)
+        body_out.lines.extend(self._header_lines(line.lineno))
+        self._compile_lines(body_in, body_out, span[1:])
         # Head and body call each other, so both forward the union of their macros
         loop_macros_string = self._macros_forwarder(body_out.macros | cond.macros)
         self._append_line_to_block_out(
             body_out, _Line(f"return run function {head_function_name}{loop_macros_string}", line.lineno)
         )
-        self._write_function(body_function_name, body_out, line, block_in.sf.local_path)
+        self._add_output(body_function_name, body_out, line)
 
         head_out = _BlockOutput()
-        head_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
+        head_out.lines.extend(self._header_lines(line.lineno))
         for setup_line in cond.setup_lines:
             self._append_line_to_block_out(head_out, setup_line)
         self._append_line_to_block_out(
@@ -1202,127 +1391,86 @@ class Compile:
                 line.lineno,
             ),
         )
-        if cond.report_error_command is not None:
-            head_out.lines.append(self._condition_error_line(cond.report_error_command, exit_function=False))
-        self._write_function(head_function_name, head_out, line, block_in.sf.local_path)
+        self._add_output(head_function_name, head_out, line)
 
         self._append_line_to_block_out(
             block_out, _Line(f"function {head_function_name}{self._macros_forwarder(head_out.macros)}", line.lineno)
         )
         if body_out.can_return:
-            block_out.can_return = True
-            for handler_string in self._RET_HANDLER_FULL if depth == 1 else self._RET_HANDLER_PARTIAL:
-                block_out.lines.append(handler_string)
+            self._append_return_handler(block_in, block_out)
 
     # Compile an if/elif condition to execute subcommands.
-    def _compile_condition(
-        self, block_in: _BlockInput, counts: dict[str, int], args: str, line: _Line
-    ) -> _CompiledCondition:
+    def _compile_condition(self, block_in: _BlockInput, args: str, line: _Line) -> _CompiledCondition:
         node = self._normalize_condition(self._parse_condition(args, line))
-        or_functions: dict[_CondOp, str] = {}
+        cond_in = _ConditionInput(block_in, line, {})
         if not self._condition_has_macro_or(node):
-            subcommands = self._condition_subcommands(block_in, counts, or_functions, node, line)
+            subcommands = self._condition_subcommands(cond_in, node)
             macros = set(self._iter_macro_names(_Line(subcommands, line.lineno)))
-            return _CompiledCondition([], subcommands, None, macros)
+            return _CompiledCondition([], subcommands, macros)
 
         clauses = self._condition_clauses(node)
-        if len(clauses) > self._COND_MAX_CLAUSES:
-            raise BLSyntaxError(
-                f"This condition expands to {len(clauses)} clauses (max {self._COND_MAX_CLAUSES}) because of macros "
-                "inside 'or'. Simplify it or move the macros out of the 'or'.",
-                line,
-            )
-        cond_function_name, cond_out = self._write_condition_function(block_in, counts, or_functions, clauses, line)
+        cond_function_name, cond_out = self._add_condition_function(cond_in, clauses)
         holder = f"{self._BL_COND_HOLDER} {self._BL_RESERVED_SCOREBOARD}"
         macros_string = self._macros_forwarder(cond_out.macros)
-        message = f"[Blocklight] Macro substitution failed in condition at {block_in.sf.local_path}:{line.lineno}"
         return _CompiledCondition(
             [
-                _Line(f"scoreboard players set {holder} 2", line.lineno),
                 _Line(
                     f"execute store result score {holder} run function {cond_function_name}{macros_string}",
                     line.lineno,
                 ),
             ],
             f"if score {holder} matches 1",
-            f"tellraw @a[tag={self._BL_DEBUG_TAG}] {json.dumps({'text': message, 'color': 'red'})}",
             cond_out.macros,
         )
 
-    # Report a macro substitution failure recorded in the cond holder, optionally returning.
-    def _condition_error_line(self, report_error_command: str, exit_function: bool) -> str:
-        return_prefix = "return run " if exit_function else ""
-        return (
-            f"execute if score {self._BL_COND_HOLDER} {self._BL_RESERVED_SCOREBOARD} matches 2 "
-            f"run {return_prefix}{report_error_command}"
-        )
-
-    # Execute subcommands testing a normalized condition. Writes one helper per distinct 'or' node (`or_functions`).
-    def _condition_subcommands(
-        self,
-        block_in: _BlockInput,
-        counts: dict[str, int],
-        or_functions: dict[_CondOp, str],
-        node: _CondNode,
-        line: _Line,
-    ) -> str:
-        if isinstance(node, _CondAtom):
+    # Execute subcommands testing a normalized condition. Adds one helper per distinct 'or' node.
+    def _condition_subcommands(self, cond_in: _ConditionInput, node: _ConditionalNode) -> str:
+        if isinstance(node, _ConditionalStatement):
             return f"{'unless' if node.negated else 'if'} {node.text}"
         if node.op == "and":
-            return " ".join(
-                self._condition_subcommands(block_in, counts, or_functions, term, line) for term in node.terms
+            return " ".join(self._condition_subcommands(cond_in, term) for term in node.terms)
+        if node not in cond_in.or_functions:
+            cond_in.or_functions[node], _cond_out = self._add_condition_function(
+                cond_in, [[term] for term in node.terms]
             )
-        if node not in or_functions:
-            or_functions[node], _cond_out = self._write_condition_function(
-                block_in, counts, or_functions, [[term] for term in node.terms], line
-            )
-        return f"if function {or_functions[node]}"
+        return f"if function {cond_in.or_functions[node]}"
 
-    # Write a helper returning 1 if any clause (conjunction of terms) matches, else 0.
-    def _write_condition_function(
-        self,
-        block_in: _BlockInput,
-        counts: dict[str, int],
-        or_functions: dict[_CondOp, str],
-        clauses: list[list[_CondNode]],
-        line: _Line,
+    # Add a helper returning 1 if any clause (conjunction of terms) matches, else 0.
+    def _add_condition_function(
+        self, cond_in: _ConditionInput, clauses: list[list[_ConditionalNode]]
     ) -> tuple[str, _BlockOutput]:
-        cond_count = counts.get("cond", 0)
-        counts["cond"] = cond_count + 1
-        cond_function_name = f"{block_in.function_name}_helper/cond_{cond_count}"
+        cond_function_name = self._helper_name(cond_in.block_in.function_name, "cond")
         cond_out = _BlockOutput()
-        cond_out.lines.extend(self._header_lines(block_in.sf.local_path, line.lineno))
+        cond_out.lines.extend(self._header_lines(cond_in.line.lineno))
         for clause in clauses:
-            subcommands = " ".join(
-                self._condition_subcommands(block_in, counts, or_functions, term, line) for term in clause
-            )
-            self._append_line_to_block_out(cond_out, _Line(f"execute {subcommands} run return 1", line.lineno))
+            subcommands = " ".join(self._condition_subcommands(cond_in, term) for term in clause)
+            self._append_line_to_block_out(cond_out, _Line(f"execute {subcommands} run return 1", cond_in.line.lineno))
         cond_out.lines.append("return 0")
-        self._write_function(cond_function_name, cond_out, line, block_in.sf.local_path)
+        self._add_output(cond_function_name, cond_out, cond_in.line)
         return cond_function_name, cond_out
 
     # Distribute 'and' over macro-bearing 'or' nodes, giving clauses in order. Macro-free subtrees stay whole.
     @staticmethod
-    def _condition_clauses(node: _CondNode) -> list[list[_CondNode]]:
-        if isinstance(node, _CondAtom) or not Compile._condition_has_macro(node):
+    def _condition_clauses(node: _ConditionalNode) -> list[list[_ConditionalNode]]:
+        if isinstance(node, _ConditionalStatement) or not Compile._condition_has_macro(node):
             return [[node]]
         if node.op == "or":
             return [clause for term in node.terms for clause in Compile._condition_clauses(term)]
-        clauses: list[list[_CondNode]] = [[]]
+        clauses: list[list[_ConditionalNode]] = [[]]
         for term in node.terms:
             clauses = [clause + term_clause for clause in clauses for term_clause in Compile._condition_clauses(term)]
         return clauses
 
     @staticmethod
-    def _condition_has_macro(node: _CondNode) -> bool:
-        if isinstance(node, _CondAtom):
+    def _condition_has_macro(node: _ConditionalNode) -> bool:
+        if isinstance(node, _ConditionalStatement):
             return "$(" in node.text
         return any(Compile._condition_has_macro(term) for term in node.terms)
 
     # Whether any 'or' node references a macro.
     @staticmethod
-    def _condition_has_macro_or(node: _CondNode) -> bool:
-        if isinstance(node, _CondAtom):
+    def _condition_has_macro_or(node: _ConditionalNode) -> bool:
+        if isinstance(node, _ConditionalStatement):
             return False
         if node.op == "or" and Compile._condition_has_macro(node):
             return True
@@ -1330,44 +1478,44 @@ class Compile:
 
     # Push 'not' down to atoms using De Morgan's law and flatten nested same-operator nodes.
     @staticmethod
-    def _normalize_condition(node: _CondNode, negate: bool = False) -> _CondNode:
-        if isinstance(node, _CondAtom):
+    def _normalize_condition(node: _ConditionalNode, negate: bool = False) -> _ConditionalNode:
+        if isinstance(node, _ConditionalStatement):
             return node._replace(negated=node.negated != negate)
         if node.op == "not":
             return Compile._normalize_condition(node.terms[0], not negate)
         op = {"and": "or", "or": "and"}[node.op] if negate else node.op
-        terms: list[_CondNode] = []
+        terms: list[_ConditionalNode] = []
         for term in node.terms:
             normalized = Compile._normalize_condition(term, negate)
-            if isinstance(normalized, _CondOp) and normalized.op == op:
+            if isinstance(normalized, _ConditionalOperator) and normalized.op == op:
                 terms.extend(normalized.terms)
             else:
                 terms.append(normalized)
-        return _CondOp(op, tuple(terms))
+        return _ConditionalOperator(op, tuple(terms))
 
     # Parse an if/elif condition into a tree. Precedence: 'not' > 'and' > 'or'.
     @staticmethod
-    def _parse_condition(args: str, line: _Line) -> _CondNode:
-        def parse_binary(op: str, parse_term: Callable[[], _CondNode]) -> _CondNode:
+    def _parse_condition(args: str, line: _Line) -> _ConditionalNode:
+        def parse_binary(op: str, parse_term: Callable[[], _ConditionalNode]) -> _ConditionalNode:
             nonlocal pos
             terms = [parse_term()]
             while pos < len(tokens) and tokens[pos][0] == op:
                 pos += 1
                 terms.append(parse_term())
-            return terms[0] if len(terms) == 1 else _CondOp(op, tuple(terms))
+            return terms[0] if len(terms) == 1 else _ConditionalOperator(op, tuple(terms))
 
-        def parse_or() -> _CondNode:
+        def parse_or() -> _ConditionalNode:
             return parse_binary("or", parse_and)
 
-        def parse_and() -> _CondNode:
+        def parse_and() -> _ConditionalNode:
             return parse_binary("and", parse_not)
 
-        def parse_not() -> _CondNode:
+        def parse_not() -> _ConditionalNode:
             nonlocal pos
             kind = tokens[pos][0] if pos < len(tokens) else ""
             if kind == "not":
                 pos += 1
-                return _CondOp("not", (parse_not(),))
+                return _ConditionalOperator("not", (parse_not(),))
             if kind == "(":
                 pos += 1
                 node = parse_or()
@@ -1379,7 +1527,7 @@ class Compile:
                 return node
             if kind == "atom":
                 pos += 1
-                return _CondAtom(tokens[pos - 1][1])
+                return _ConditionalStatement(tokens[pos - 1][1])
             if pos >= len(tokens):
                 raise BLSyntaxError("This condition ends where a condition was expected.", line)
             raise BLSyntaxError(f"This condition expected a condition but found '{tokens[pos][1]}'.", line)
@@ -1435,7 +1583,7 @@ class Compile:
                 tokens.append((ch, ch))
                 atom_start = i + 1
             else:
-                for op in Compile._COND_OPERATORS:
+                for op in frozenset(("and", "or", "not")):
                     if not (cond.startswith(op, i) and is_boundary(i - 1) and is_boundary(i + len(op))):
                         continue
                     if op == "not" and cond[atom_start:i].strip():  # unary: only where an operand begins
@@ -1457,15 +1605,12 @@ class Compile:
     @staticmethod
     def _append_line_to_block_out(block_out: _BlockOutput, line: _Line) -> None:
         text = line.text.lstrip()
-        has_macro_dollar = text.startswith("$")
         uses_macros = False
         if "$(" in text:
             for macro_name in Compile._iter_macro_names(line):
                 block_out.macros.add(macro_name)
                 uses_macros = True
-        if has_macro_dollar and not uses_macros:
-            raise BLSyntaxError("This line begins with '$' but declares no macro.", line)
-        block_out.lines.append("$" + text if not has_macro_dollar and uses_macros else text)
+        block_out.lines.append("$" + text if uses_macros else text)
 
     # Build a vanilla `{...}` clause forwarding each of `macros` from the current function's
     # own macro arguments into the function being called.
@@ -1488,40 +1633,44 @@ class Compile:
             if not name:
                 raise BLSyntaxError("This line declares an empty macro '$()'.", line)
             if set(name) - Compile._MACRO_NAME_CHARS:
-                raise BLSyntaxError(f"Macro names may only use a-z, A-Z, 0-9 and '_': '$({name})'", line)
+                raise BLSyntaxError(f"The macro name '{name}' may only use a-z, A-Z, 0-9 and '_'.", line)
             yield name
             search_from = name_end + 1
 
-    # Execute a python: block and return the lines it emits re-indented to `depth` and anchored at the block header.
-    @staticmethod
-    def _handle_python_block(block_in: _BlockInput, span: list[_Line], depth: int) -> list[_Line]:
-        sf = block_in.sf
+    # Execute a python: block and return the lines it emits re-indented to the block's depth and anchored at its header.
+    def _handle_python_block(self, block_in: _BlockInput, span: list[_Line]) -> list[_Line]:
         head = span[0]
         body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
 
-        if tui.get_no_python():
+        if self._pack.options.no_python:
             raise BLSyntaxError("This Python block is disabled due to your compile parameters.", head)
-        orchestration.mark_needs_recompile(sf.local_path)
+        self._compiled.ran_python = True
         emitted: list[str] = []
 
         def emit(command: object) -> None:
             emitted.append(str(command))
 
-        scope: dict[str, object] = {"emit": emit, "bl": _PythonBlockContext(block_in)}
+        local_path = self._source.local_path
+        bl = _PythonBlockContext(
+            PATH=local_path,
+            FILE=local_path.rsplit("/", 1)[-1],
+            NAMESPACE=self._source.namespace,
+            PACK_NAME=self._pack.name,
+            PACK_FORMAT=self._pack.format,
+            FUNCTION_NAME=block_in.source_function_name,
+            OUTPUT_FUNCTION_NAME=block_in.function_name,
+        )
+        scope: dict[str, object] = {"emit": emit, "bl": bl}
         try:
-            exec(compile(body, f"{sf.local_path}:{head.lineno} python: block", "exec"), scope)
+            exec(compile(body, f"{local_path}:{head.lineno} python: block", "exec"), scope)
         except SyntaxError as err:
-            raise BLPythonError(f"invalid Python in this block: {err.msg}", head) from err
+            raise BLPythonError(f"This Python block is invalid: {err.msg}.", head) from err
         except Exception as err:
-            raise BLPythonError(f"this block raised {type(err).__name__}: {err}", head) from err
+            raise BLPythonError(f"This Python block raised {type(err).__name__}: {err}.", head) from err
 
-        prefix = Compile._single_indent(sf) * depth
-        return [
-            _Line(prefix + part, head.lineno)
-            for command in emitted
-            for part in str(command).split("\n")
-            if part.strip()
-        ]
+        prefix = self._indent * block_in.depth
+        raw_lines = (prefix + part for command in emitted for part in str(command).split("\n"))
+        return list(_iter_clean_lines((head.lineno, raw_line) for raw_line in raw_lines))
 
 
 def main() -> None:
@@ -1529,21 +1678,32 @@ def main() -> None:
         required = ".".join(str(part) for part in _MIN_PYTHON)
         raise SystemExit(f"Blocklight {_BL_VERSION_STRING} requires Python {required} or newer.")
 
-    tui.parse_args()
-    tui.start()
-    orchestration.run()
-    tui.finish()
+    # parse CLI args
+    parser = argparse.ArgumentParser(
+        prog="blocklight",
+        description="A blazing fast mcfunction microcompiler. Run Blocklight from your datapack's root directory (the \
+                     directory containing pack.mcmeta).",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="test compile without writing any files to disk")
+    parser.add_argument("--force", action="store_true", help="ignore compiler optimizations and recompile all files")
+    parser.add_argument("--no-python", action="store_true", help="reject `python` blocks")
+    parser.add_argument("--no-symlink", action="store_true", help="reject read and write of symlinked files.")
+    parser.add_argument("--safe", action="store_true", help="safely compile a datapack if you do not trust the author")
+    parser.add_argument("--version", action="version", version=f"Blocklight {_BL_VERSION_STRING}")
+    args = parser.parse_args()
+    options = CompilerOptions(
+        no_python=args.no_python or args.safe,
+        no_symlink=args.no_symlink or args.safe,
+        dry_run=args.dry_run,
+        force=args.force,
+    )
 
-
-tui: TUI = TUI()
-orchestration: Orchestration = Orchestration()
-
-
-# Replaces both globals with fresh instances. Mainly for test isolation between compile runs.
-def reset_globals() -> None:
-    global tui, orchestration
-    tui = TUI()
-    orchestration = Orchestration()
+    # Compile
+    start_time = time.monotonic()  # timer starts after argparse for branding reasons :)
+    result = Pack(options).compile()
+    report(result, time.monotonic() - start_time)
+    if result.errors:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

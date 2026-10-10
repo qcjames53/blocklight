@@ -1,0 +1,7 @@
+{
+  "values": [
+    "_bl:load",
+    "bl_example:functions/hello_load",
+    "bl_example:hello_universe"
+  ]
+}
