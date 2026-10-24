@@ -1,12 +1,12 @@
 # Blocklight - A blazing fast mcfunction microcompiler
 
-Blocklight is a Minecraft Java Edition datapack microcompiler which aims to be quicker, more useful, and syntax-divorced than other datapack compilers. Blocklight solves these core issues and stays out of your way for everything else:
+Blocklight is a Minecraft Java Edition datapack microcompiler which aims to be quicker, more useful, and more syntax-divorced than other datapack compilers. Blocklight solves these core issues (and stays out of your way for everything else):
 
 - Multiple functions within one file, each robustly supporting function macros and return commands from ANYWHERE inside the function.
 - Flow control within functions using conditional statements (if, elif, while, etc).
 - Execution context modification using modifiers (as, at, in, positioned, etc).
 - Inline Python for robust pre-compile output (useful for pre-computed loops or complex math)
-- Strong focus on speed and optimization (big datapacks usually compile in under 20ms)
+- Strong focus on speed and optimization (1-5ms compiles are common)
 
 ## Quick start, aka WHERE IS MY EXE?
 1. Install Python on your system from your package manager or https://python.org.
