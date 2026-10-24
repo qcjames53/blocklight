@@ -10,7 +10,7 @@
 # 1) Install Python on your system (3.10+).
 # 2) Copy this script to your datapack's top level directory (e.g. `my_pack/blocklight.py`).
 # 3) Create your .bl source files in `<pack>/data/<namespace>/blocklight/`. See the GitHub link above for examples.
-# 4) Run the compiler in the terminal from the pack root with `python3 blocklight.py`. Pass `--help` for options.
+# 4) Run the compiler in the terminal from your datapack's top level directory with `python3 blocklight.py`.
 
 
 # ----- Contributor guidelines ----- #
@@ -48,7 +48,7 @@ from typing import IO, ClassVar, NamedTuple, cast
 
 # ----- Tweakable constants ----- #
 _BL_VERSION = (1, 0)
-_BL_IS_DEV_BUILD = True
+_BL_IS_DEV_BUILD = False
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
 
 # ----- Compiler internal constants ----- #
