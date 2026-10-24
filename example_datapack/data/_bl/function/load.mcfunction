@@ -1,2 +1,2 @@
-# Compiled by Blocklight 1.0.dev (https://github.com/qcjames53/blocklight)
+# Compiled by Blocklight 1.0 (https://github.com/qcjames53/blocklight)
 scoreboard objectives add _bl dummy

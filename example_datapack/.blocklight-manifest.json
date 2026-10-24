@@ -18,6 +18,11 @@
       ],
       "source_hash": "e66a7e4c7318c9cb7ebe54636bb349298377983cc5c2010639d3f051006dea26bc342d5fda8c38c339f68e087850e1cd2784bd71155be8661399997b67523a3d"
     },
+    "data/bl_example/blocklight/clear_chunk.bl": {
+      "outputs": [
+        "data/bl_example/function/clear_chunk/clear_chunk.mcfunction"
+      ]
+    },
     "data/bl_example/blocklight/fizzbuzz.bl": {
       "outputs": [
         "data/bl_example/function/fizzbuzz/fizzbuzz.mcfunction",
@@ -63,6 +68,9 @@
     },
     "data/bl_example/blocklight/python.bl": {
       "outputs": [
+        "data/bl_example/function/python/generated_0.mcfunction",
+        "data/bl_example/function/python/generated_1.mcfunction",
+        "data/bl_example/function/python/generated_2.mcfunction",
         "data/bl_example/function/python/hardcode_example.mcfunction",
         "data/bl_example/function/python/locators_example.mcfunction"
       ]

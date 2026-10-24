@@ -15,3 +15,10 @@ function locators_example
         emit(f"say Top-level function name: '{bl.FUNCTION_NAME}'")
         emit(f"say Minecraft function name containing this script's output: '{bl.OUTPUT_FUNCTION_NAME}'")
         emit(f"say Blocklight version: '{bl.BLOCKLIGHT_VERSION}'")
+
+
+# A `python` block at the top level must emit whole functions, which compile just like ones written by hand.
+python
+    for i in range(3):
+        emit(f"function generated_{i}")
+        emit(f"    say Hello, generated function {i}!")

@@ -3,7 +3,7 @@
 import pytest
 
 import blocklight
-from tests.harness import compile_error, compile_pack
+from tests.harness import build, compile_error, compile_pack
 
 
 def test_modifier_blocks_record_context():
@@ -276,6 +276,55 @@ function f
         emit("say outer")
 """).call("f")
     assert run.said == ["inner", "outer"]
+
+
+def test_top_level_python_block_emits_functions():
+    pack = compile_pack("""\
+python
+    for i in range(2):
+        emit(f"function f{i}\\n    say {i}")
+function g
+    say g
+""")
+    assert pack.errors == []
+    assert pack.call("f0").said == ["0"]
+    assert pack.call("f1").said == ["1"]
+    assert pack.call("g").said == ["g"]
+
+
+def test_top_level_python_block_can_emit_load_functions():
+    pack = compile_pack("""\
+python
+    emit("load function setup\\n    say loaded")
+""")
+    assert pack.load_functions == {"_bl:load", "test:main/setup"}
+
+
+def test_top_level_python_error_does_not_stop_later_functions():
+    pack = build("""\
+python
+    raise ValueError("boom")
+function g
+    say g
+""")
+    assert [type(error) for error in pack.errors] == [blocklight.BLPythonError]
+    assert pack.errors[0].lineno == 1
+    assert pack.call("g").said == ["g"]
+
+
+def test_top_level_python_block_must_emit_a_function_first():
+    error = compile_error("""\
+python
+    emit("    say hi")
+""")
+    assert isinstance(error, blocklight.BLSyntaxError)
+    assert error.lineno == 1
+    assert "must emit a function definition" in str(error)
+
+
+def test_top_level_python_block_needs_a_body_and_no_arguments():
+    assert "no body" in str(compile_error("python\n"))
+    assert "does not permit arguments" in str(compile_error("python x\n    emit('')\n"))
 
 
 def test_python_emitted_elif_without_an_if_reports_the_python_block():

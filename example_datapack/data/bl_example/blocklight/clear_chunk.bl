@@ -1,0 +1,9 @@
+# This example shows how useful Python can be for pre-compile hardcoding.
+
+function clear_chunk
+    python
+        for i in range(16):
+            for j in range(16):
+                x = f"~{i}" if i != 0 else "~"
+                z = f"~{j}" if j != 0 else "~"
+                emit(f"fill {x} -63 {z} {x} 319 {z} air")
