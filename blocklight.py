@@ -979,17 +979,38 @@ class Compile:
         self._helper_counts: dict[tuple[str, str], int] = {}  # (output function, helper kind) -> helpers named
 
     # Compile every function in the source, isolating recoverable errors to the function that raised them.
+    # A top-level python block must emit whole functions, which are compiled next in place of the block.
     def compile(self) -> CompiledSource:
         try:
             self._indent = self._single_indent(self._source.source_lines)
-            for function_lines in self._iter_spans(self._source.source_lines, 0):
+            span_iters = [self._iter_spans(self._source.source_lines, 0)]
+            while span_iters:
+                span = next(span_iters[-1], None)
+                if span is None:  # base case
+                    span_iters.pop()
+                    continue
                 try:
-                    self._compile_function(function_lines)
+                    if span[0].as_keyword_args()[0] == "python":
+                        span_iters.append(self._iter_spans(self._handle_top_level_python_block(span), 0))
+                    else:
+                        self._compile_function(span)
                 except BLNonFatalError as err:
                     self._compiled.errors.append(err)
         except BLFatalError as err:
             self._compiled.errors.append(err)
         return self._compiled
+
+    # Execute a python block outside any function and return the lines it emits, which must begin a function.
+    def _handle_top_level_python_block(self, span: list[_Line]) -> list[_Line]:
+        head = span[0]
+        if len(span) == 1:
+            raise BLSyntaxError("This 'python' block has no body.", head)
+        if head.text != "python":
+            raise BLSyntaxError("This 'python' block does not permit arguments.", head)
+        emitted = self._handle_python_block(_BlockInput("", "", 0), span)
+        if emitted and emitted[0].text[:1].isspace():
+            raise BLSyntaxError("This top-level Python block must emit a function definition first.", head)
+        return emitted
 
     @staticmethod
     def _single_indent(lines: list[_Line]) -> str:

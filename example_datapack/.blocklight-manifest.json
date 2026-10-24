@@ -63,6 +63,9 @@
     },
     "data/bl_example/blocklight/python.bl": {
       "outputs": [
+        "data/bl_example/function/python/generated_0.mcfunction",
+        "data/bl_example/function/python/generated_1.mcfunction",
+        "data/bl_example/function/python/generated_2.mcfunction",
         "data/bl_example/function/python/hardcode_example.mcfunction",
         "data/bl_example/function/python/locators_example.mcfunction"
       ]
