@@ -283,6 +283,7 @@ class CompiledSource:
         self.tick: set[str] = set()  # output paths of tick functions
         self.errors: list[BLError] = []
         self.ran_python = False  # a python block ran, and may emit something different next run
+        self.python_scope: dict[str, object] = {}  # globals shared by every python block in this source file
 
 
 # Compile info exposed inside python blocks as the `bl` object
@@ -1681,7 +1682,9 @@ class Compile:
             FUNCTION_NAME=block_in.source_function_name,
             OUTPUT_FUNCTION_NAME=block_in.function_name,
         )
-        scope: dict[str, object] = {"emit": emit, "bl": bl}
+        scope = self._compiled.python_scope
+        scope["emit"] = emit
+        scope["bl"] = bl
         try:
             exec(compile(body, f"{local_path}:{head.lineno} python: block", "exec"), scope)
         except SyntaxError as err:
