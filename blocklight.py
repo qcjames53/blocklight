@@ -47,7 +47,7 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import IO, ClassVar, NamedTuple, cast
 
 # ----- Tweakable constants ----- #
-_BL_VERSION = (1, 0)
+_BL_VERSION = (1, 1)
 _BL_IS_DEV_BUILD = False
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
 
@@ -245,6 +245,7 @@ class _BlockInput(NamedTuple):
     source_function_name: str  # Name of the top-level function from the function def
     function_name: str  # Name of the output function this block will compile into
     depth: int  # Indentation depth of the block's lines; 1 for a function's own body
+    source_function_id: str = ""  # Namespaced name of the top-level function; empty outside any function
 
 
 # Mutable accumulator built up while compiling one block.
@@ -284,18 +285,6 @@ class CompiledSource:
         self.errors: list[BLError] = []
         self.ran_python = False  # a python block ran, and may emit something different next run
         self.python_scope: dict[str, object] = {}  # globals shared by every python block in this source file
-
-
-# Compile info exposed inside python blocks as the `bl` object
-class _PythonBlockContext(NamedTuple):
-    PATH: str
-    FILE: str
-    NAMESPACE: str
-    PACK_NAME: str
-    PACK_FORMAT: int | None
-    FUNCTION_NAME: str
-    OUTPUT_FUNCTION_NAME: str
-    BLOCKLIGHT_VERSION: str = _BL_VERSION_STRING
 
 
 # What writing one output did, or would do in a dry run
@@ -1063,6 +1052,15 @@ class Compile:
         self._helper_counts[(function_name, kind)] = index + 1
         return f"{function_name}_helper/{kind}_{index}"
 
+    # Prefix of the namespaced name of every non-root function defined in this source file: "<ns>:<subdirs>/<file>/".
+    def _sibling_id_prefix(self) -> str:
+        _data, namespace, _src_root, *subdirs, source_file = self._source.local_path.split("/")
+        return f"{namespace}:" + "/".join([*subdirs, source_file.removesuffix(".bl")]) + "/"
+
+    # Namespaced path of non-root function `function_name` defined in this source file, as `_compile_function` names it.
+    def _local_function_path(self, function_name: str) -> str:
+        return self._sibling_id_prefix() + function_name
+
     # Header lines every compiled output file (including helpers) begins with.
     def _header_lines(self, lineno: int) -> list[str]:
         return [*self._HEADER_TEXT, f"#     `{self._source.local_path}:{lineno}`"]
@@ -1119,12 +1117,11 @@ class Compile:
             return
 
         # Determine output filepath from the source path, data/<ns>/blocklight/*/f.bl
-        _data, namespace, _src_root, *subdirs, source_file = self._source.local_path.split("/")
         if is_root:
-            function_path = function_name
+            output_name = f"{self._source.namespace}:{function_name}"
         else:
-            function_path = "/".join([*subdirs, source_file.removesuffix(".bl"), function_name])
-        block_in = _BlockInput(function_name, f"{namespace}:{function_path}", 1)
+            output_name = self._local_function_path(function_name)
+        block_in = _BlockInput(function_name, output_name, 1, output_name)
         output_filepath = self._function_filepath(block_in.function_name)
         # Checked before its helpers continue the earlier function's numbering
         if output_filepath in self._compiled.mcf_outputs:
@@ -1673,18 +1670,20 @@ class Compile:
             emitted.append(str(command))
 
         local_path = self._source.local_path
-        bl = _PythonBlockContext(
-            PATH=local_path,
-            FILE=local_path.rsplit("/", 1)[-1],
-            NAMESPACE=self._source.namespace,
-            PACK_NAME=self._pack.name,
-            PACK_FORMAT=self._pack.format,
-            FUNCTION_NAME=block_in.source_function_name,
-            OUTPUT_FUNCTION_NAME=block_in.function_name,
-        )
         scope = self._compiled.python_scope
         scope["emit"] = emit
-        scope["bl"] = bl
+        function_id = block_in.source_function_id  # empty outside any function
+        scope.update(
+            SOURCE_FILEPATH=local_path,
+            FUNCTION_NAME=block_in.source_function_name or None,
+            FUNCTION_ID=function_id or None,
+            OUTPUT_FILEPATH=self._function_filepath(function_id) if function_id else None,
+            HELPER_ID=block_in.function_name or None,
+            SIBLING_ID_PREFIX=self._sibling_id_prefix(),
+            PACK_NAME=self._pack.name,
+            PACK_FORMAT=self._pack.format,
+            BLOCKLIGHT_VERSION=_BL_VERSION_STRING,
+        )
         try:
             exec(compile(body, f"{local_path}:{head.lineno} python: block", "exec"), scope)
         except SyntaxError as err:

@@ -1,5 +1,7 @@
 # One behavior check per block structure, exercising the compile harness end to end.
 
+import re
+
 import pytest
 
 import blocklight
@@ -199,9 +201,65 @@ def test_python_block_emits_commands():
 function f
     python
         for i in range(3):
-            emit(f"say {i} {bl.FUNCTION_NAME}")
+            emit(f"say {i} {FUNCTION_NAME}")
 """).call("f")
     assert run.said == ["0 f", "1 f", "2 f"]
+
+
+def test_python_block_defines_name_and_location_constants():
+    run = compile_pack("""\
+function f
+    python
+        emit(f"say {SOURCE_FILEPATH} {FUNCTION_NAME} {FUNCTION_ID}")
+        emit(f"say {OUTPUT_FILEPATH} {HELPER_ID} {SIBLING_ID_PREFIX}")
+    as @s
+        python
+            emit(f"say {FUNCTION_ID} {HELPER_ID}")
+""").call("f")
+    assert run.said == [
+        "data/test/blocklight/main.bl f test:main/f",
+        "data/test/function/main/f.mcfunction test:main/f test:main/",
+        "test:main/f test:main/f_helper/as_0",
+    ]
+
+
+def test_python_block_defines_pack_and_version_constants():
+    run = compile_pack("""\
+function f
+    python
+        emit(f"say {PACK_NAME} {PACK_FORMAT}")
+        emit(f"say {BLOCKLIGHT_VERSION}")
+""").call("f")
+    assert run.said[0] == "pack 107"
+    assert re.fullmatch(r"\d+\.\d+", run.said[1])
+
+
+def test_python_block_constants_for_a_root_function():
+    run = compile_pack("""\
+root function f
+    python
+        emit(f"say {FUNCTION_ID} {OUTPUT_FILEPATH}")
+""").call("test:f")
+    assert run.said == ["test:f data/test/function/f.mcfunction"]
+
+
+def test_python_block_outside_a_function_has_no_function_constants():
+    run = compile_pack("""\
+python
+    emit(f"function f\\n    say {FUNCTION_NAME} {FUNCTION_ID} {HELPER_ID} {OUTPUT_FILEPATH} {SIBLING_ID_PREFIX}")
+""").call("f")
+    assert run.said == ["None None None None test:main/"]
+
+
+def test_python_sibling_id_prefix_names_a_sibling_function():
+    pack = compile_pack("""\
+function f
+    python
+        emit(f"function {SIBLING_ID_PREFIX}g")
+function g
+    say hi
+""")
+    assert pack.call("f").said == ["hi"]
 
 
 def test_python_block_can_emit_blocks_beside_written_ones():
