@@ -191,7 +191,7 @@ def test_python_output_is_cleaned_like_source():
     run = compile_pack("""\
 function f
     python
-        emit("as @s   \\n    $say $(word)\\n    # dropped")
+        cmd("as @s   \\n    $say $(word)\\n    # dropped")
 """).call("f", macros={"word": "hi"})
     assert run.said == ["hi"]
 
@@ -201,7 +201,7 @@ def test_python_block_emits_commands():
 function f
     python
         for i in range(3):
-            emit(f"say {i} {FUNCTION_NAME}")
+            cmd(f"say {i} {FUNCTION_NAME}")
 """).call("f")
     assert run.said == ["0 f", "1 f", "2 f"]
 
@@ -210,11 +210,11 @@ def test_python_block_defines_name_and_location_constants():
     run = compile_pack("""\
 function f
     python
-        emit(f"say {SOURCE_FILEPATH} {FUNCTION_NAME} {FUNCTION_ID}")
-        emit(f"say {OUTPUT_FILEPATH} {HELPER_ID} {SIBLING_ID_PREFIX}")
+        cmd(f"say {SOURCE_FILEPATH} {FUNCTION_NAME} {FUNCTION_ID}")
+        cmd(f"say {OUTPUT_FILEPATH} {HELPER_ID} {SIBLING_ID_PREFIX}")
     as @s
         python
-            emit(f"say {FUNCTION_ID} {HELPER_ID}")
+            cmd(f"say {FUNCTION_ID} {HELPER_ID}")
 """).call("f")
     assert run.said == [
         "data/test/blocklight/main.bl f test:main/f",
@@ -227,8 +227,8 @@ def test_python_block_defines_pack_and_version_constants():
     run = compile_pack("""\
 function f
     python
-        emit(f"say {PACK_NAME} {PACK_FORMAT}")
-        emit(f"say {BLOCKLIGHT_VERSION}")
+        cmd(f"say {PACK_NAME} {PACK_FORMAT}")
+        cmd(f"say {BLOCKLIGHT_VERSION}")
 """).call("f")
     assert run.said[0] == "pack 107"
     assert re.fullmatch(r"\d+\.\d+", run.said[1])
@@ -238,7 +238,7 @@ def test_python_block_constants_for_a_root_function():
     run = compile_pack("""\
 root function f
     python
-        emit(f"say {FUNCTION_ID} {OUTPUT_FILEPATH}")
+        cmd(f"say {FUNCTION_ID} {OUTPUT_FILEPATH}")
 """).call("test:f")
     assert run.said == ["test:f data/test/function/f.mcfunction"]
 
@@ -246,7 +246,8 @@ root function f
 def test_python_block_outside_a_function_has_no_function_constants():
     run = compile_pack("""\
 python
-    emit(f"function f\\n    say {FUNCTION_NAME} {FUNCTION_ID} {HELPER_ID} {OUTPUT_FILEPATH} {SIBLING_ID_PREFIX}")
+    with blk("function f"):
+        cmd(f"say {FUNCTION_NAME} {FUNCTION_ID} {HELPER_ID} {OUTPUT_FILEPATH} {SIBLING_ID_PREFIX}")
 """).call("f")
     assert run.said == ["None None None None test:main/"]
 
@@ -255,7 +256,7 @@ def test_python_sibling_id_prefix_names_a_sibling_function():
     pack = compile_pack("""\
 function f
     python
-        emit(f"function {SIBLING_ID_PREFIX}g")
+        cmd(f"function {SIBLING_ID_PREFIX}g")
 function g
     say hi
 """)
@@ -268,7 +269,8 @@ function f
     as @s
         say first
     python
-        emit("as @s\\n    say second")
+        with blk("as @s"):
+            cmd("say second")
 """).call("f")
     assert run.said == ["first", "second"]
 
@@ -280,7 +282,8 @@ function f
         say one
     python
         for i in range(2, 4):
-            emit(f"elif score #x v matches {i}\\n    say {i}")
+            with blk(f"elif score #x v matches {i}"):
+                cmd(f"say {i}")
     else
         say other
 """)
@@ -292,7 +295,8 @@ def test_python_block_can_start_an_if_chain():
     pack = compile_pack("""\
 function f
     python
-        emit("if score #x v matches 1\\n    say one")
+        with blk("if score #x v matches 1"):
+            cmd("say one")
     else
         say other
 """)
@@ -320,7 +324,7 @@ function f
     if score #x v matches 1
         say one
     python
-        emit("say after")
+        cmd("say after")
 """)
     assert pack.call("f", objectives=["v"], scores={("#x", "v"): 1}).said == ["one", "after"]
     assert pack.call("f", objectives=["v"], scores={("#x", "v"): 2}).said == ["after"]
@@ -330,8 +334,9 @@ def test_python_block_can_emit_python_blocks():
     run = compile_pack("""\
 function f
     python
-        emit("python\\n    emit('say inner')")
-        emit("say outer")
+        with blk("python"):
+            cmd("cmd('say inner')")
+        cmd("say outer")
 """).call("f")
     assert run.said == ["inner", "outer"]
 
@@ -340,7 +345,8 @@ def test_top_level_python_block_emits_functions():
     pack = compile_pack("""\
 python
     for i in range(2):
-        emit(f"function f{i}\\n    say {i}")
+        with blk(f"function f{i}"):
+            cmd(f"say {i}")
 function g
     say g
 """)
@@ -353,7 +359,8 @@ function g
 def test_top_level_python_block_can_emit_load_functions():
     pack = compile_pack("""\
 python
-    emit("load function setup\\n    say loaded")
+    with blk("load function setup"):
+        cmd("say loaded")
 """)
     assert pack.load_functions == {"_bl:load", "test:main/setup"}
 
@@ -366,14 +373,14 @@ function g
     say g
 """)
     assert [type(error) for error in pack.errors] == [blocklight.BLPythonError]
-    assert pack.errors[0].lineno == 1
+    assert pack.errors[0].lineno == 2
     assert pack.call("g").said == ["g"]
 
 
 def test_top_level_python_block_must_emit_a_function_first():
     error = compile_error("""\
 python
-    emit("    say hi")
+    cmd("    say hi")
 """)
     assert isinstance(error, blocklight.BLSyntaxError)
     assert error.lineno == 1
@@ -382,7 +389,7 @@ python
 
 def test_top_level_python_block_needs_a_body_and_no_arguments():
     assert "no body" in str(compile_error("python\n"))
-    assert "does not permit arguments" in str(compile_error("python x\n    emit('')\n"))
+    assert "does not permit arguments" in str(compile_error("python x\n    cmd('')\n"))
 
 
 def test_python_emitted_elif_without_an_if_reports_the_python_block():
@@ -390,7 +397,8 @@ def test_python_emitted_elif_without_an_if_reports_the_python_block():
 function f
     say first
     python
-        emit("elif score #x v matches 1\\n    say one")
+        with blk("elif score #x v matches 1"):
+            cmd("say one")
 """)
     assert isinstance(error, blocklight.BLSyntaxError)
     assert error.lineno == 3
@@ -414,3 +422,48 @@ function f
 """)
     assert isinstance(error, blocklight.BLSyntaxError)
     assert error.lineno == 2
+
+
+def test_python_blk_nests_with_the_files_own_indent():
+    for unit in (" ", "  ", "    ", "\t"):
+        src = "\n".join(
+            [
+                "function f",
+                f"{unit}python",
+                f"{unit * 2}with blk('as @s'):",
+                f"{unit * 3}with blk('at @s'):",
+                f"{unit * 4}cmd('say deep')",
+                f"{unit * 3}cmd('say mid')",
+                f"{unit * 2}cmd('say top')",
+                "",
+            ]
+        )
+        assert compile_pack(src).call("f").said == ["deep", "mid", "top"]
+
+
+def test_python_blk_restores_depth_after_an_exception():
+    error = compile_error("""\
+function f
+    python
+        with blk("as @s"):
+            raise ValueError("boom")
+""")
+    assert isinstance(error, blocklight.BLPythonError)
+
+
+def test_python_errors_report_the_line_inside_the_block():
+    raised = compile_error("""\
+function f
+    say first
+    python
+        x = 1
+        # comment lines do not shift the report
+        def boom():
+            raise ValueError("boom")
+        boom()
+""")
+    assert isinstance(raised, blocklight.BLPythonError)
+    assert raised.lineno == 7
+    invalid = compile_error("function f\n    python\n        x = 1\n        x = = 2\n")
+    assert isinstance(invalid, blocklight.BLPythonError)
+    assert invalid.lineno == 4

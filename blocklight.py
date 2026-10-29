@@ -311,6 +311,30 @@ class BuildResult:
         self.outputs_deleted = 0  # stale outputs and the setup function, once no sources are left
 
 
+# Emitter helpers exposed to python blocks.
+class _PythonEmitter:
+    def __init__(self, indent: str, depth: int) -> None:
+        self.lines: list[str] = []
+        self._indent = indent
+        self._depth = depth
+
+    # Emits a command at the correct indentation
+    def cmd(self, command: object) -> None:
+        prefix = self._indent * self._depth
+        self.lines.extend(prefix + part for part in str(command).split("\n"))
+
+    # Emits a block header at the correct indentation and indents child contents
+    def blk(self, header: object) -> "_PythonEmitter":
+        self.cmd(header)
+        return self
+
+    def __enter__(self) -> None:
+        self._depth += 1
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self._depth -= 1
+
+
 # ----- Terminal ----- #
 # Print the compile results. All errors + a status line.
 def report(result: BuildResult, elapsed: float) -> None:
@@ -1012,8 +1036,6 @@ class Compile:
                 raise BLFatalError(
                     "This file's detected indentation schema mixes tabs and spaces, which is not permitted.", line
                 )
-            if indent == " ":
-                raise BLFatalError("This file's indentation schema must be at least two spaces per indent.", line)
             return indent
         return "  "
 
@@ -1656,6 +1678,12 @@ class Compile:
             yield name
             search_from = name_end + 1
 
+    # The source line behind line `body_lineno` of a python block's body, or its header when unknown.
+    # Body line k is span[k]: the body is the span's cleaned lines joined with newlines.
+    @staticmethod
+    def _python_line(span: list[_Line], body_lineno: int | None) -> _Line:
+        return span[body_lineno] if body_lineno is not None and 0 < body_lineno < len(span) else span[0]
+
     # Execute a python: block and return the lines it emits re-indented to the block's depth and anchored at its header.
     def _handle_python_block(self, block_in: _BlockInput, span: list[_Line]) -> list[_Line]:
         head = span[0]
@@ -1664,14 +1692,11 @@ class Compile:
         if self._pack.options.no_python:
             raise BLSyntaxError("This Python block is disabled due to your compile parameters.", head)
         self._compiled.ran_python = True
-        emitted: list[str] = []
-
-        def emit(command: object) -> None:
-            emitted.append(str(command))
-
+        emitter = _PythonEmitter(self._indent, block_in.depth)
         local_path = self._source.local_path
         scope = self._compiled.python_scope
-        scope["emit"] = emit
+        scope["cmd"] = emitter.cmd
+        scope["blk"] = emitter.blk
         function_id = block_in.source_function_id  # empty outside any function
         scope.update(
             SOURCE_FILEPATH=local_path,
@@ -1684,16 +1709,24 @@ class Compile:
             PACK_FORMAT=self._pack.format,
             BLOCKLIGHT_VERSION=_BL_VERSION_STRING,
         )
+        filename = f"{local_path}:{head.lineno} python: block"
         try:
-            exec(compile(body, f"{local_path}:{head.lineno} python: block", "exec"), scope)
+            exec(compile(body, filename, "exec"), scope)
         except SyntaxError as err:
-            raise BLPythonError(f"This Python block is invalid: {err.msg}.", head) from err
+            raise BLPythonError(
+                f"This Python block is invalid: {err.msg}.", self._python_line(span, err.lineno)
+            ) from err
         except Exception as err:
-            raise BLPythonError(f"This Python block raised {type(err).__name__}: {err}.", head) from err
+            tb_lineno = None
+            tb = err.__traceback__
+            while tb is not None:  # deepest frame still inside this block's own code
+                if tb.tb_frame.f_code.co_filename == filename:
+                    tb_lineno = tb.tb_lineno
+                tb = tb.tb_next
+            message = f"This Python block raised {type(err).__name__}: {err}."
+            raise BLPythonError(message, self._python_line(span, tb_lineno)) from err
 
-        prefix = self._indent * block_in.depth
-        raw_lines = (prefix + part for command in emitted for part in str(command).split("\n"))
-        return list(_iter_clean_lines((head.lineno, raw_line) for raw_line in raw_lines))
+        return list(_iter_clean_lines((head.lineno, raw_line) for raw_line in emitter.lines))
 
 
 def main() -> None:

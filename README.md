@@ -5,7 +5,7 @@ Blocklight is a Minecraft Java Edition datapack microcompiler which aims to be q
 - Multiple functions within one file, each robustly supporting function macros and return commands from ANYWHERE inside the function.
 - Flow control within functions using conditional statements (if, elif, while, etc).
 - Execution context modification using modifiers (as, at, in, positioned, etc).
-- Inline Python for robust pre-compile output (useful for pre-computed loops or complex math)
+- Inline Python for robust pre-compile operations (useful for pre-computed loops or complex math)
 - Strong focus on speed and optimization (1-5ms compiles are common)
 
 ## Quick start, aka WHERE IS MY EXE?
@@ -22,7 +22,7 @@ Well, "best" is relative. I promise you'll really enjoy using Blocklight, though
 
 There are probably dozens of other mcfunction compilers that will make raycasting or location triggers dead easy. The problem with the alternative compilers is you need to abide by a rigid, opinionated syntax which more or less still has all the drawbacks of vanilla mcfunction once compiled. When you walk a little off the happy path, everything falls apart. Blocklight enforces the minimum syntax required to output a valid datapack. The world doesn't need another outdated, unmaintained command compiler refusing to build because the datapack format updated again and changed the syntax of the `swing` command. Blocklight doesn't even know what a command _is_. That's intentional.
 
-In a similiar vein, we don't need a worse version of Python to help build functions. Need to clear a forest chunk by chunk? Use Python. Need to build a binary search for a specific NBT tag? Use Python. We have a tool that can emit the same command 200 times in a row. It's called Python. If Python can do something at compile-time, let's use it.
+In a similiar vein, we don't need a worse version of Python to hardcode pre-compile bulk operations or complex math. Need to clear a forest chunk by chunk? Use Python. Need to build a binary search for a specific NBT tag? Use Python. We have a tool that can emit the same command 200 times in a row. It's called Python. If Python can do something at compile-time, let's use it.
 
 ## Contributor guidelines
 Contributions and issues are more than welcome! I'll try to get to everything as quickly as I can.
