@@ -48,11 +48,10 @@ from typing import IO, ClassVar, NamedTuple, cast
 
 # ----- Tweakable constants ----- #
 _BL_VERSION = (1, 1)
-_BL_IS_DEV_BUILD = False
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
 
 # ----- Compiler internal constants ----- #
-_BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
+_BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}"
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
 _IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # Windows junction; stat only defines it on Windows
 _ANSI_RED = "\033[31m"
