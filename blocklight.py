@@ -312,15 +312,13 @@ class BuildResult:
 
 # Emitter helpers exposed to python blocks.
 class _PythonEmitter:
-    def __init__(self, indent: str, depth: int) -> None:
-        self.lines: list[str] = []
-        self._indent = indent
-        self._depth = depth
+    def __init__(self) -> None:
+        self.lines: list[tuple[int, str]] = []  # (depth relative to the python block, text)
+        self._depth = 0
 
-    # Emits a command at the correct indentation
+    # Emits a command at the current relative depth
     def cmd(self, command: object) -> None:
-        prefix = self._indent * self._depth
-        self.lines.extend(prefix + part for part in str(command).split("\n"))
+        self.lines.extend((self._depth, part) for part in str(command).split("\n"))
 
     # Emits a block header at the correct indentation and indents child contents
     def blk(self, header: object) -> "_PythonEmitter":
@@ -1749,7 +1747,7 @@ class Compile:
 
         body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
         scope = self._compiled.python_scope
-        emitter = _PythonEmitter(self._indent, block_in.depth)
+        emitter = _PythonEmitter()
         self._update_python_scope(block_in, emitter)
         filename = f"{self._source.local_path}:{span[0].lineno} python: block"
         try:
@@ -1768,7 +1766,10 @@ class Compile:
             message = f"This Python block raised {type(err).__name__}: {err}."
             raise BLPythonError(message, self._python_line(span, tb_lineno)) from err
 
-        return list(_iter_clean_lines((span[0].lineno, raw_line) for raw_line in emitter.lines))
+        indent = self._indent * block_in.depth
+        return list(
+            _iter_clean_lines((span[0].lineno, indent + self._indent * depth + text) for depth, text in emitter.lines)
+        )
 
 
 def main() -> None:
