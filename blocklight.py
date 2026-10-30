@@ -47,12 +47,11 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import IO, ClassVar, NamedTuple, cast
 
 # ----- Tweakable constants ----- #
-_BL_VERSION = (1, 0)
-_BL_IS_DEV_BUILD = False
+_BL_VERSION = (1, 1)
 _MIN_PYTHON = (3, 10)  # Python 3.10 EOL October 2026
 
 # ----- Compiler internal constants ----- #
-_BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}" + (".dev" if _BL_IS_DEV_BUILD else "")
+_BL_VERSION_STRING = f"{_BL_VERSION[0]}.{_BL_VERSION[1]}"
 _FUNCTION_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits + "_-")
 _IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # Windows junction; stat only defines it on Windows
 _ANSI_RED = "\033[31m"
@@ -245,6 +244,7 @@ class _BlockInput(NamedTuple):
     source_function_name: str  # Name of the top-level function from the function def
     function_name: str  # Name of the output function this block will compile into
     depth: int  # Indentation depth of the block's lines; 1 for a function's own body
+    source_function_id: str = ""  # Namespaced name of the top-level function; empty outside any function
 
 
 # Mutable accumulator built up while compiling one block.
@@ -283,18 +283,7 @@ class CompiledSource:
         self.tick: set[str] = set()  # output paths of tick functions
         self.errors: list[BLError] = []
         self.ran_python = False  # a python block ran, and may emit something different next run
-
-
-# Compile info exposed inside python blocks as the `bl` object
-class _PythonBlockContext(NamedTuple):
-    PATH: str
-    FILE: str
-    NAMESPACE: str
-    PACK_NAME: str
-    PACK_FORMAT: int | None
-    FUNCTION_NAME: str
-    OUTPUT_FUNCTION_NAME: str
-    BLOCKLIGHT_VERSION: str = _BL_VERSION_STRING
+        self.python_scope: dict[str, object] = {}  # globals shared by every python block in this source file
 
 
 # What writing one output did, or would do in a dry run
@@ -319,6 +308,28 @@ class BuildResult:
         self.outputs_unchanged = 0
         self.outputs_reused = 0  # kept as-is from sources that were not recompiled
         self.outputs_deleted = 0  # stale outputs and the setup function, once no sources are left
+
+
+# Emitter helpers exposed to python blocks.
+class _PythonEmitter:
+    def __init__(self) -> None:
+        self.lines: list[tuple[int, str]] = []  # (depth relative to the python block, text)
+        self._depth = 0
+
+    # Emits a command at the current relative depth
+    def cmd(self, command: object) -> None:
+        self.lines.extend((self._depth, part) for part in str(command).split("\n"))
+
+    # Emits a block header at the correct indentation and indents child contents
+    def blk(self, header: object) -> "_PythonEmitter":
+        self.cmd(header)
+        return self
+
+    def __enter__(self) -> None:
+        self._depth += 1
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self._depth -= 1
 
 
 # ----- Terminal ----- #
@@ -1022,8 +1033,6 @@ class Compile:
                 raise BLFatalError(
                     "This file's detected indentation schema mixes tabs and spaces, which is not permitted.", line
                 )
-            if indent == " ":
-                raise BLFatalError("This file's indentation schema must be at least two spaces per indent.", line)
             return indent
         return "  "
 
@@ -1061,6 +1070,15 @@ class Compile:
         index = self._helper_counts.get((function_name, kind), 0)
         self._helper_counts[(function_name, kind)] = index + 1
         return f"{function_name}_helper/{kind}_{index}"
+
+    # Prefix of the namespaced name of every non-root function defined in this source file: "<ns>:<subdirs>/<file>/".
+    def _sibling_id_prefix(self) -> str:
+        _data, namespace, _src_root, *subdirs, source_file = self._source.local_path.split("/")
+        return f"{namespace}:" + "/".join([*subdirs, source_file.removesuffix(".bl")]) + "/"
+
+    # Namespaced path of non-root function `function_name` defined in this source file, as `_compile_function` names it.
+    def _local_function_path(self, function_name: str) -> str:
+        return self._sibling_id_prefix() + function_name
 
     # Header lines every compiled output file (including helpers) begins with.
     def _header_lines(self, lineno: int) -> list[str]:
@@ -1118,12 +1136,11 @@ class Compile:
             return
 
         # Determine output filepath from the source path, data/<ns>/blocklight/*/f.bl
-        _data, namespace, _src_root, *subdirs, source_file = self._source.local_path.split("/")
         if is_root:
-            function_path = function_name
+            output_name = f"{self._source.namespace}:{function_name}"
         else:
-            function_path = "/".join([*subdirs, source_file.removesuffix(".bl"), function_name])
-        block_in = _BlockInput(function_name, f"{namespace}:{function_path}", 1)
+            output_name = self._local_function_path(function_name)
+        block_in = _BlockInput(function_name, output_name, 1, output_name)
         output_filepath = self._function_filepath(block_in.function_name)
         # Checked before its helpers continue the earlier function's numbering
         if output_filepath in self._compiled.mcf_outputs:
@@ -1159,7 +1176,12 @@ class Compile:
             if span is None:
                 span_iters.pop()
                 continue
-            line = span[0]
+
+            # Expand inline python inside ticks
+            line = self._expand_inline_python(span[0], block_in)
+            if line is not span[0]:
+                span = [line, *span[1:]]
+
             text = line.text.lstrip()  # right is already stripped
             has_body = len(span) > 1
             keyword, args = line.as_keyword_args()
@@ -1167,8 +1189,7 @@ class Compile:
             if keyword == "summon" and not has_body:  # without a block, 'summon' is the vanilla command
                 keyword_spec = None
 
-            # Anything other than a continuing 'elif'/'else' closes a pending if-chain.
-            # A python block's output may contain 'elif'/'else' so we inline expand before closing the chain.
+            # Anything other than a continuing 'elif'/'else' closes a pending if-chain (python block may continue chain)
             if keyword not in ("elif", "else", "python") and pending_chain:
                 self._compile_if_chain(block_in, block_out, pending_chain)
                 pending_chain = []
@@ -1633,8 +1654,8 @@ class Compile:
                 uses_macros = True
         block_out.lines.append("$" + text if uses_macros else text)
 
-    # Build a vanilla `{...}` clause forwarding each of `macros` from the current function's
-    # own macro arguments into the function being called.
+    # Build a vanilla `{...}` clause forwarding each of `macros` from the current function's own macro arguments into
+    # the function being called.
     @staticmethod
     def _macros_forwarder(macros: set[str]) -> str:
         if not macros:
@@ -1658,40 +1679,97 @@ class Compile:
             yield name
             search_from = name_end + 1
 
-    # Execute a python: block and return the lines it emits re-indented to the block's depth and anchored at its header.
-    def _handle_python_block(self, block_in: _BlockInput, span: list[_Line]) -> list[_Line]:
-        head = span[0]
-        body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
+    # The python source line behind body_lineno. Returns header if unknown.
+    @staticmethod
+    def _python_line(span: list[_Line], body_lineno: int | None) -> _Line:
+        return span[body_lineno] if body_lineno is not None and 0 < body_lineno < len(span) else span[0]
 
-        if self._pack.options.no_python:
-            raise BLSyntaxError("This Python block is disabled due to your compile parameters.", head)
-        self._compiled.ran_python = True
-        emitted: list[str] = []
-
-        def emit(command: object) -> None:
-            emitted.append(str(command))
-
-        local_path = self._source.local_path
-        bl = _PythonBlockContext(
-            PATH=local_path,
-            FILE=local_path.rsplit("/", 1)[-1],
-            NAMESPACE=self._source.namespace,
+    # Update the python scope's constants and emitter methods.
+    def _update_python_scope(self, block_in: _BlockInput, emitter: _PythonEmitter | None) -> None:
+        function_id = block_in.source_function_id  # empty outside any function
+        self._compiled.python_scope.update(
+            cmd=emitter.cmd if emitter else None,
+            blk=emitter.blk if emitter else None,
+            SOURCE_FILEPATH=self._source.local_path,
+            FUNCTION_NAME=block_in.source_function_name or None,
+            FUNCTION_ID=function_id or None,
+            OUTPUT_FILEPATH=self._function_filepath(function_id) if function_id else None,
+            HELPER_ID=block_in.function_name or None,
+            SIBLING_ID_PREFIX=self._sibling_id_prefix(),
             PACK_NAME=self._pack.name,
             PACK_FORMAT=self._pack.format,
-            FUNCTION_NAME=block_in.source_function_name,
-            OUTPUT_FUNCTION_NAME=block_in.function_name,
+            BLOCKLIGHT_VERSION=_BL_VERSION_STRING,
         )
-        scope: dict[str, object] = {"emit": emit, "bl": bl}
-        try:
-            exec(compile(body, f"{local_path}:{head.lineno} python: block", "exec"), scope)
-        except SyntaxError as err:
-            raise BLPythonError(f"This Python block is invalid: {err.msg}.", head) from err
-        except Exception as err:
-            raise BLPythonError(f"This Python block raised {type(err).__name__}: {err}.", head) from err
 
-        prefix = self._indent * block_in.depth
-        raw_lines = (prefix + part for command in emitted for part in str(command).split("\n"))
-        return list(_iter_clean_lines((head.lineno, raw_line) for raw_line in raw_lines))
+    # Evaluate each inline python tick expression and replace the current line with the result.
+    def _expand_inline_python(self, line: _Line, block_in: _BlockInput) -> _Line:
+        text = line.text
+        if "`" not in text:
+            return line
+        if self._pack.options.no_python:
+            raise BLSyntaxError("This inline python expression is disabled due to your compile parameters.", line)
+        self._compiled.ran_python = True
+        self._update_python_scope(block_in, None)
+
+        filename = f"{self._source.local_path}:{line.lineno} inline python expression"
+        parts: list[str] = []
+        index = 0
+        while index < len(text):
+            tick = text.find("`", index)
+            if tick == -1:
+                parts.append(text[index:])
+                break
+            parts.append(text[index:tick])
+            if text[tick + 1 : tick + 2] == "`":
+                parts.append("`")
+                index = tick + 2
+                continue
+            end = text.find("`", tick + 1)
+            if end == -1:
+                raise BLSyntaxError("This line opens an inline python expression but never closes it.", line)
+            try:
+                value = str(eval(compile(text[tick + 1 : end].strip(), filename, "eval"), self._compiled.python_scope))
+            except SyntaxError as err:
+                raise BLPythonError(f"This inline python expression is invalid: {err.msg}.", line) from err
+            except Exception as err:
+                raise BLPythonError(f"This inline python expression raised {type(err).__name__}: {err}.", line) from err
+            if "\n" in value:
+                raise BLPythonError("This inline python expression produced more than one line.", line)
+            parts.append(value)
+            index = end + 1
+        return _Line("".join(parts).rstrip(), line.lineno)
+
+    # Execute a python: block and return the lines it emits re-indented to the block's depth and anchored at its header.
+    def _handle_python_block(self, block_in: _BlockInput, span: list[_Line]) -> list[_Line]:
+        if self._pack.options.no_python:
+            raise BLSyntaxError("This Python block is disabled due to your compile parameters.", span[0])
+        self._compiled.ran_python = True
+
+        body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
+        scope = self._compiled.python_scope
+        emitter = _PythonEmitter()
+        self._update_python_scope(block_in, emitter)
+        filename = f"{self._source.local_path}:{span[0].lineno} python: block"
+        try:
+            exec(compile(body, filename, "exec"), scope)
+        except SyntaxError as err:
+            raise BLPythonError(
+                f"This Python block is invalid: {err.msg}.", self._python_line(span, err.lineno)
+            ) from err
+        except Exception as err:
+            tb_lineno = None
+            tb = err.__traceback__
+            while tb is not None:  # deepest frame still inside this block's own code
+                if tb.tb_frame.f_code.co_filename == filename:
+                    tb_lineno = tb.tb_lineno
+                tb = tb.tb_next
+            message = f"This Python block raised {type(err).__name__}: {err}."
+            raise BLPythonError(message, self._python_line(span, tb_lineno)) from err
+
+        indent = self._indent * block_in.depth
+        return list(
+            _iter_clean_lines((span[0].lineno, indent + self._indent * depth + text) for depth, text in emitter.lines)
+        )
 
 
 def main() -> None:

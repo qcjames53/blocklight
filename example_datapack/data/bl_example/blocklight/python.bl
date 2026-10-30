@@ -1,24 +1,50 @@
+# Python blocks allow complex pre-compile operations. Use `blk` and `cmd` to emit blocks and commands, respectively.
+# Emitted blocks and commands are compiled like any other blocklight source.
 function hardcode_example
     python
-        for i in range(20):
-            emit("say hi")
+        cmd("say starting")
+        for i in range(1,4):
+            # `blk` opens a block header; child cmd and blk calls are indented.
+            with blk(f"as @a[tag=team_{i}]"):
+                cmd(f"say hello, team {i}")
+                cmd(f"particle flame ~ ~{i * 3 - 0.5} ~")
+
+
+# Python blocks can also be composed at the source's top level to emit hardcoded functions in their entirety.
+python
+    for i in range(3):
+        with blk(f"function generated_function_{i}"):
+            cmd(f"say Hello, generated function {i}!")
+
+
+# Python blocks within a source file share scope and are evaluated top to bottom
+function scope_share
+    python
+        def foo_string():
+            return "foo"
+    say other commands...
+    python
+        cmd(f"say {foo_string()}")
+
+
+# Blocklight also supports an alternative inline python syntax using tick chars.
+# The expression's result is cast to a string and inserted into the line.
+function inline_syntax
+    say This syntax makes it easy to insert strings like "`foo_string()`" into various commands.
+
+    # Using inline python for NBT is significantly cleaner than using f strings plus braces in a python block.
+    summon block_display ~ ~ ~ {Tags:["`foo_string()`"]}
 
 
 function locators_example
-    # These are all available inside every `python` block for free.
+    # These constants are available inside every `python` block for free.
     python
-        emit(f"say Relative filepath: '{bl.PATH}'")
-        emit(f"say Datapack name: '{bl.PACK_NAME}'")
-        emit(f"say Datapack format: '{bl.PACK_FORMAT}'")  # Major pack version only (e.g. 107), resolves to min_format if not provided explicitly
-        emit(f"say Namespace: '{bl.NAMESPACE}'")
-        emit(f"say Source file: '{bl.FILE}'")
-        emit(f"say Top-level function name: '{bl.FUNCTION_NAME}'")
-        emit(f"say Minecraft function name containing this script's output: '{bl.OUTPUT_FUNCTION_NAME}'")
-        emit(f"say Blocklight version: '{bl.BLOCKLIGHT_VERSION}'")
-
-
-# A `python` block at the top level must emit whole functions, which compile just like ones written by hand.
-python
-    for i in range(3):
-        emit(f"function generated_{i}")
-        emit(f"    say Hello, generated function {i}!")
+        cmd(f"say {SOURCE_FILEPATH}")  # Filepath of this file (e.g. "data/foo/blocklight/bar/baz.bl")
+        cmd(f"say {FUNCTION_NAME}")  # Name of this function (e.g. "baz")
+        cmd(f"say {FUNCTION_ID}")  # Callable output function ID (e.g. "foo:bar/baz")
+        cmd(f"say {OUTPUT_FILEPATH}")  # Filepath of the current output file (e.g. "data/foo/function/bar/baz.mcfunction")
+        cmd(f"say {HELPER_ID}")  # Callable output function ID of current helper (e.g. "foo:bar/baz_helper/as_0")
+        cmd(f"say {SIBLING_ID_PREFIX}")  # Append names of other functions in this file to call (e.g. "foo:bar/" + "other_function")
+        cmd(f"say {PACK_NAME}")  # Datapack name (e.g. "example_pack")
+        cmd(f"say {PACK_FORMAT}")  # Datapack format (e.g. 107)
+        cmd(f"say {BLOCKLIGHT_VERSION}")  # (e.g. 1.1)

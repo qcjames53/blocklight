@@ -416,7 +416,7 @@ def test_summary_colors_with_errors(monkeypatch: pytest.MonkeyPatch):
 )
 def test_pack_format_is_read_from_pack_mcmeta(pack_section: dict[str, object], pack_format: int):
     _write("pack.mcmeta", json.dumps({"pack": pack_section}))
-    _assert_ok(_compile("function a\n    python\n        emit(f'say {bl.PACK_FORMAT}')\n"))
+    _assert_ok(_compile("function a\n    python\n        cmd(f'say {PACK_FORMAT}')\n"))
     assert _read(_OUTPUT_A).endswith(f"say {pack_format}")
 
 
