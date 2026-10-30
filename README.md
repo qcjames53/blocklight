@@ -11,7 +11,7 @@ Blocklight is a Minecraft Java Edition datapack microcompiler which aims to be q
 ## Quick start, aka WHERE IS MY EXE?
 1. Install Python on your system from your package manager or https://python.org.
     - Python 3.10 or higher is required.
-2. [Download Blocklight 1.0](https://github.com/qcjames53/blocklight/releases/download/v1.0/blocklight.py).
+2. [Download Blocklight 1.1](https://github.com/qcjames53/blocklight/releases/download/v1.0/blocklight.py).
 3. Copy `blocklight.py` to your datapack's top level directory (e.g. `my_pack/blocklight.py`).
 4. Create your .bl source files in `<pack>/data/<namespace>/blocklight/`.
     - See the [example datapack](https://github.com/qcjames53/blocklight/tree/main/example_datapack) for example source files.

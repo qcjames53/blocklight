@@ -4,7 +4,8 @@ function hardcode_example
     python
         cmd("say starting")
         for i in range(1,4):
-            with blk(f"as @a[tag=team_{i}]"):  # `blk` opens a block header; child cmd and blk calls are indented.
+            # `blk` opens a block header; child cmd and blk calls are indented.
+            with blk(f"as @a[tag=team_{i}]"):
                 cmd(f"say hello, team {i}")
                 cmd(f"particle flame ~ ~{i * 3 - 0.5} ~")
 
@@ -14,6 +15,25 @@ python
     for i in range(3):
         with blk(f"function generated_function_{i}"):
             cmd(f"say Hello, generated function {i}!")
+
+
+# Python blocks within a source file share scope and are evaluated top to bottom
+function scope_share
+    python
+        def foo_string():
+            return "foo"
+    say other commands...
+    python
+        cmd(f"say {foo_string()}")
+
+
+# Blocklight also supports an alternative inline python syntax using tick chars.
+# The expression's result is cast to a string and inserted into the line.
+function inline_syntax
+    say This syntax makes it easy to insert strings like "`foo_string()`" into various commands.
+
+    # Using inline python for NBT is significantly cleaner than using f strings plus braces in a python block.
+    summon block_display ~ ~ ~ {Tags:["`foo_string()`"]}
 
 
 function locators_example

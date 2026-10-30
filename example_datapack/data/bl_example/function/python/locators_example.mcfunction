@@ -1,6 +1,6 @@
 # Compiled by Blocklight 1.1 (https://github.com/qcjames53/blocklight)
 # Changes saved to this file will not persist. Please modify the bl source file instead:
-#     `data/bl_example/blocklight/python.bl:19`
+#     `data/bl_example/blocklight/python.bl:39`
 say data/bl_example/blocklight/python.bl
 say locators_example
 say bl_example:python/locators_example

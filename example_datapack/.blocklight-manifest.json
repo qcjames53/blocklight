@@ -75,7 +75,9 @@
         "data/bl_example/function/python/hardcode_example_helper/as_0.mcfunction",
         "data/bl_example/function/python/hardcode_example_helper/as_1.mcfunction",
         "data/bl_example/function/python/hardcode_example_helper/as_2.mcfunction",
-        "data/bl_example/function/python/locators_example.mcfunction"
+        "data/bl_example/function/python/inline_syntax.mcfunction",
+        "data/bl_example/function/python/locators_example.mcfunction",
+        "data/bl_example/function/python/scope_share.mcfunction"
       ]
     }
   },

@@ -1178,7 +1178,12 @@ class Compile:
             if span is None:
                 span_iters.pop()
                 continue
-            line = span[0]
+
+            # Expand inline python inside ticks
+            line = self._expand_inline_python(span[0], block_in)
+            if line is not span[0]:
+                span = [line, *span[1:]]
+
             text = line.text.lstrip()  # right is already stripped
             has_body = len(span) > 1
             keyword, args = line.as_keyword_args()
@@ -1186,8 +1191,7 @@ class Compile:
             if keyword == "summon" and not has_body:  # without a block, 'summon' is the vanilla command
                 keyword_spec = None
 
-            # Anything other than a continuing 'elif'/'else' closes a pending if-chain.
-            # A python block's output may contain 'elif'/'else' so we inline expand before closing the chain.
+            # Anything other than a continuing 'elif'/'else' closes a pending if-chain (python block may continue chain)
             if keyword not in ("elif", "else", "python") and pending_chain:
                 self._compile_if_chain(block_in, block_out, pending_chain)
                 pending_chain = []
@@ -1652,8 +1656,8 @@ class Compile:
                 uses_macros = True
         block_out.lines.append("$" + text if uses_macros else text)
 
-    # Build a vanilla `{...}` clause forwarding each of `macros` from the current function's
-    # own macro arguments into the function being called.
+    # Build a vanilla `{...}` clause forwarding each of `macros` from the current function's own macro arguments into
+    # the function being called.
     @staticmethod
     def _macros_forwarder(macros: set[str]) -> str:
         if not macros:
@@ -1677,28 +1681,18 @@ class Compile:
             yield name
             search_from = name_end + 1
 
-    # The source line behind line `body_lineno` of a python block's body, or its header when unknown.
-    # Body line k is span[k]: the body is the span's cleaned lines joined with newlines.
+    # The python source line behind body_lineno. Returns header if unknown.
     @staticmethod
     def _python_line(span: list[_Line], body_lineno: int | None) -> _Line:
         return span[body_lineno] if body_lineno is not None and 0 < body_lineno < len(span) else span[0]
 
-    # Execute a python: block and return the lines it emits re-indented to the block's depth and anchored at its header.
-    def _handle_python_block(self, block_in: _BlockInput, span: list[_Line]) -> list[_Line]:
-        head = span[0]
-        body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
-
-        if self._pack.options.no_python:
-            raise BLSyntaxError("This Python block is disabled due to your compile parameters.", head)
-        self._compiled.ran_python = True
-        emitter = _PythonEmitter(self._indent, block_in.depth)
-        local_path = self._source.local_path
-        scope = self._compiled.python_scope
-        scope["cmd"] = emitter.cmd
-        scope["blk"] = emitter.blk
+    # Update the python scope's constants and emitter methods.
+    def _update_python_scope(self, block_in: _BlockInput, emitter: _PythonEmitter | None) -> None:
         function_id = block_in.source_function_id  # empty outside any function
-        scope.update(
-            SOURCE_FILEPATH=local_path,
+        self._compiled.python_scope.update(
+            cmd=emitter.cmd if emitter else None,
+            blk=emitter.blk if emitter else None,
+            SOURCE_FILEPATH=self._source.local_path,
             FUNCTION_NAME=block_in.source_function_name or None,
             FUNCTION_ID=function_id or None,
             OUTPUT_FILEPATH=self._function_filepath(function_id) if function_id else None,
@@ -1708,7 +1702,56 @@ class Compile:
             PACK_FORMAT=self._pack.format,
             BLOCKLIGHT_VERSION=_BL_VERSION_STRING,
         )
-        filename = f"{local_path}:{head.lineno} python: block"
+
+    # Evaluate each inline python tick expression and replace the current line with the result.
+    def _expand_inline_python(self, line: _Line, block_in: _BlockInput) -> _Line:
+        text = line.text
+        if "`" not in text:
+            return line
+        if self._pack.options.no_python:
+            raise BLSyntaxError("This inline python expression is disabled due to your compile parameters.", line)
+        self._compiled.ran_python = True
+        self._update_python_scope(block_in, None)
+
+        filename = f"{self._source.local_path}:{line.lineno} inline python expression"
+        parts: list[str] = []
+        index = 0
+        while index < len(text):
+            tick = text.find("`", index)
+            if tick == -1:
+                parts.append(text[index:])
+                break
+            parts.append(text[index:tick])
+            if text[tick + 1 : tick + 2] == "`":
+                parts.append("`")
+                index = tick + 2
+                continue
+            end = text.find("`", tick + 1)
+            if end == -1:
+                raise BLSyntaxError("This line opens an inline python expression but never closes it.", line)
+            try:
+                value = str(eval(compile(text[tick + 1 : end].strip(), filename, "eval"), self._compiled.python_scope))
+            except SyntaxError as err:
+                raise BLPythonError(f"This inline python expression is invalid: {err.msg}.", line) from err
+            except Exception as err:
+                raise BLPythonError(f"This inline python expression raised {type(err).__name__}: {err}.", line) from err
+            if "\n" in value:
+                raise BLPythonError("This inline python expression produced more than one line.", line)
+            parts.append(value)
+            index = end + 1
+        return _Line("".join(parts).rstrip(), line.lineno)
+
+    # Execute a python: block and return the lines it emits re-indented to the block's depth and anchored at its header.
+    def _handle_python_block(self, block_in: _BlockInput, span: list[_Line]) -> list[_Line]:
+        if self._pack.options.no_python:
+            raise BLSyntaxError("This Python block is disabled due to your compile parameters.", span[0])
+        self._compiled.ran_python = True
+
+        body = textwrap.dedent("\n".join(ln.text for ln in span[1:]))
+        scope = self._compiled.python_scope
+        emitter = _PythonEmitter(self._indent, block_in.depth)
+        self._update_python_scope(block_in, emitter)
+        filename = f"{self._source.local_path}:{span[0].lineno} python: block"
         try:
             exec(compile(body, filename, "exec"), scope)
         except SyntaxError as err:
@@ -1725,7 +1768,7 @@ class Compile:
             message = f"This Python block raised {type(err).__name__}: {err}."
             raise BLPythonError(message, self._python_line(span, tb_lineno)) from err
 
-        return list(_iter_clean_lines((head.lineno, raw_line) for raw_line in emitter.lines))
+        return list(_iter_clean_lines((span[0].lineno, raw_line) for raw_line in emitter.lines))
 
 
 def main() -> None:

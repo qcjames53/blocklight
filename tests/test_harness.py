@@ -467,3 +467,99 @@ function f
     invalid = compile_error("function f\n    python\n        x = 1\n        x = = 2\n")
     assert isinstance(invalid, blocklight.BLPythonError)
     assert invalid.lineno == 4
+
+
+def test_backtick_expression_uses_state_from_an_earlier_python_block():
+    run = compile_pack("""\
+function f
+    python
+        word = "hi"
+    say `word` there
+""").call("f")
+    assert run.said == ["hi there"]
+
+
+def test_backtick_expression_sees_compile_constants():
+    run = compile_pack("""\
+function f
+    say `FUNCTION_NAME` `SIBLING_ID_PREFIX`
+""").call("f")
+    assert run.said == ["f test:main/"]
+
+
+def test_backtick_expression_leaves_braces_and_quotes_alone():
+    run = compile_pack("""\
+function f
+    say {"a":"`1 + 1`"} \\"x\\"
+""").call("f")
+    assert run.said == ['{"a":"2"} \\"x\\"']
+
+
+def test_double_backtick_is_a_literal_backtick():
+    run = compile_pack("""\
+function f
+    say a``b `1`
+""").call("f")
+    assert run.said == ["a`b 1"]
+
+
+def test_backticks_in_comments_and_python_bodies_are_not_expanded():
+    run = compile_pack("""\
+function f
+    # `nope()`
+    python
+        cmd("say " + "``".join(["a", "b"]))  # the body is plain python; its emitted line is expanded like source
+""").call("f")
+    assert run.said == ["a`b"]
+
+
+def test_backtick_expression_in_a_child_block_header():
+    run = compile_pack("""\
+function f
+    python
+        selector = "@p"
+    as `selector`
+        say hi
+""").call("f")
+    assert [(m.text, m.context) for m in run.messages] == [("hi", ("as @p",))]
+
+
+def test_backtick_line_can_continue_an_if_chain():
+    pack = compile_pack("""\
+function f
+    if score #x v matches 1
+        say one
+    `"elif"` score #x v matches 2
+        say two
+    else
+        say other
+""")
+    for x, branch in [(1, "one"), (2, "two"), (3, "other")]:
+        assert pack.call("f", objectives=["v"], scores={("#x", "v"): x}).said == [branch]
+
+
+def test_unclosed_backtick_is_a_syntax_error():
+    err = compile_error("function f\n    say `1\n")
+    assert isinstance(err, blocklight.BLSyntaxError)
+    assert "never closes" in str(err)
+
+
+def test_backtick_expression_errors_point_at_the_line():
+    err = compile_error("function f\n    say `missing`\n")
+    assert isinstance(err, blocklight.BLPythonError)
+    assert "NameError" in str(err)
+    err = compile_error("function f\n    say `1 +`\n")
+    assert isinstance(err, blocklight.BLPythonError)
+    assert "invalid" in str(err)
+
+
+def test_backtick_expression_cannot_produce_multiple_lines():
+    err = compile_error('function f\n    say `"a\\nb"`\n')
+    assert isinstance(err, blocklight.BLPythonError)
+    assert "more than one line" in str(err)
+
+
+def test_backtick_expression_is_rejected_without_python():
+    err = compile_error("function f\n    say `1`\n", options=blocklight.CompilerOptions(no_python=True))
+    assert isinstance(err, blocklight.BLSyntaxError)
+    assert "disabled" in str(err)
